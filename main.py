@@ -37,16 +37,23 @@ VENDOR_ROOT = Path(__file__).resolve().parent / "data" / "vendors"
 
 
 class OrderDialog(QDialog):
-    def __init__(self, vendor: str, products: List[Dict], db: DatabaseManager, parent=None):
+    def __init__(self, vendor: str, products: List[Dict], db: DatabaseManager, parent=None, order_id: Optional[int] = None, initial_items: Optional[List[Dict]] = None):
         super().__init__(parent)
         self.vendor = vendor
         self.products = products
         self.db = db
         self.cart_items: List[Dict] = []  # Store items added to cart
+        self.order_id: Optional[int] = order_id
+        if initial_items:
+            # ensure we copy items so dialog modifications don't mutate caller data
+            self.cart_items = [dict(i) for i in initial_items]
+        self.selected_product_row: Optional[int] = None
         self.setWindowTitle(f"Create Order - {vendor}")
         self.setMinimumSize(1200, 800)
         self._build_ui()
         self._load_products_table()
+        if self.cart_items:
+            self._update_cart_table()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -93,13 +100,23 @@ class OrderDialog(QDialog):
         self.products_table.setColumnWidth(7, 90)
         self.products_table.setColumnWidth(8, 100)
         self.products_table.setColumnWidth(9, 100)
+        self.products_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.products_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.products_table.itemSelectionChanged.connect(self._update_selected_row)
         layout.addWidget(self.products_table)
-        
+
+        add_selected_layout = QHBoxLayout()
+        add_selected_layout.addStretch()
+        self.add_selected_button = QPushButton("Add selected row to cart")
+        self.add_selected_button.clicked.connect(self.on_add_selected_row_to_cart)
+        add_selected_layout.addWidget(self.add_selected_button)
+        layout.addLayout(add_selected_layout)
+
         # Cart section
         layout.addWidget(QLabel("<b>Order Cart</b>"))
-        self.cart_table = QTableWidget(0, 9)
+        self.cart_table = QTableWidget(0, 5)
         self.cart_table.setHorizontalHeaderLabels(
-            ["SKU", "Brand", "Product", "Pack", "Qty", "CTN Qty", "Unit Price", "Total", "Remove"]
+            ["SKU", "Brand", "Product", "Qty", "Remove"]
         )
         header = self.cart_table.horizontalHeader()
         for col in range(self.cart_table.columnCount()):
@@ -108,11 +125,7 @@ class OrderDialog(QDialog):
         self.cart_table.setColumnWidth(0, 140)
         self.cart_table.setColumnWidth(1, 120)
         self.cart_table.setColumnWidth(2, 420)
-        self.cart_table.setColumnWidth(3, 120)
-        self.cart_table.setColumnWidth(4, 80)
-        self.cart_table.setColumnWidth(5, 90)
-        self.cart_table.setColumnWidth(6, 100)
-        self.cart_table.setColumnWidth(7, 120)
+        self.cart_table.setColumnWidth(3, 80)
         layout.addWidget(self.cart_table)
         
         # Total and buttons
@@ -131,9 +144,13 @@ class OrderDialog(QDialog):
         button_layout.addWidget(self.notes_input)
         
         button_row = QHBoxLayout()
-        self.generate_button = QPushButton("Generate Order Sheet")
-        self.generate_button.clicked.connect(self.on_generate_order)
+        self.generate_button = QPushButton("Generate Order (Excel)")
+        self.generate_button.clicked.connect(lambda: self.on_generate_order(format="excel"))
         button_row.addWidget(self.generate_button)
+        
+        self.pdf_button = QPushButton("Export to PDF")
+        self.pdf_button.clicked.connect(lambda: self.on_generate_order(format="pdf"))
+        button_row.addWidget(self.pdf_button)
         
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.clicked.connect(self.reject)
@@ -190,19 +207,19 @@ class OrderDialog(QDialog):
             qty_combo = QComboBox()
             qty_combo.addItems([str(i) for i in range(11)])
             qty_combo.setCurrentText("0")
-            self.products_table.setCellWidget(row, 6, qty_combo)
+            self.products_table.setCellWidget(row, 7, qty_combo)
             
             # Custom qty input
             custom_qty = QSpinBox()
             custom_qty.setMinimum(0)
             custom_qty.setMaximum(10000)
             custom_qty.setValue(0)
-            self.products_table.setCellWidget(row, 7, custom_qty)
+            self.products_table.setCellWidget(row, 8, custom_qty)
             
             # Add to cart button
             add_btn = QPushButton("Add")
             add_btn.clicked.connect(lambda checked, r=row: self.on_add_to_cart(r))
-            self.products_table.setCellWidget(row, 8, add_btn)
+            self.products_table.setCellWidget(row, 9, add_btn)
 
     def _filter_products(self) -> None:
         search_text = self.search_input.text().lower()
@@ -225,26 +242,23 @@ class OrderDialog(QDialog):
             show_row = matches_search and matches_brand
             self.products_table.setRowHidden(row, not show_row)
 
-    def on_add_to_cart(self, row: int) -> None:
-        product = self.product_row_map.get(row)
-        if not product:
-            return
-        
-        qty_combo = self.products_table.cellWidget(row, 6)
-        custom_qty = self.products_table.cellWidget(row, 7)
-        
-        qty_0_10 = int(qty_combo.currentText() or 0)
+    def _get_row_quantity(self, row: int) -> int:
+        qty_combo = self.products_table.cellWidget(row, 7)
+        custom_qty = self.products_table.cellWidget(row, 8)
+        qty_0_10 = int(qty_combo.currentText() or 0) if qty_combo else 0
         custom_qty_val = custom_qty.value() if custom_qty else 0
-        
-        # Use custom qty if > 10, otherwise use combo selection
-        quantity = custom_qty_val if custom_qty_val > 10 else qty_0_10
-        
-        if quantity <= 0:
-            QMessageBox.warning(self, "Invalid quantity", "Please select a quantity > 0")
-            return
-        
-        # Add to cart
-        cart_item = {
+        return custom_qty_val if custom_qty_val > 10 else qty_0_10
+
+    def _set_row_quantity_to_zero(self, row: int) -> None:
+        qty_combo = self.products_table.cellWidget(row, 7)
+        custom_qty = self.products_table.cellWidget(row, 8)
+        if qty_combo:
+            qty_combo.setCurrentText("0")
+        if custom_qty:
+            custom_qty.setValue(0)
+
+    def _create_cart_item(self, product: Dict[str, any], quantity: int) -> Dict[str, any]:
+        return {
             "sku": product.get("sku"),
             "product_name": product.get("product_name"),
             "brand": product.get("brand"),
@@ -256,13 +270,42 @@ class OrderDialog(QDialog):
             "total_price": quantity * (product.get("ctn_qty") or 1) * (product.get("price") or 0.0),
             "extra_json": product.get("extra_json"),
         }
+
+    def on_add_to_cart(self, row: int) -> None:
+        product = self.product_row_map.get(row)
+        if not product:
+            return
+        quantity = self._get_row_quantity(row)
+        if quantity <= 0:
+            QMessageBox.warning(self, "Invalid quantity", "Please select a quantity > 0")
+            return
+        cart_item = self._create_cart_item(product, quantity)
         self.cart_items.append(cart_item)
         self._update_cart_table()
-        
-        # Reset inputs
-        qty_combo.setCurrentText("0")
-        custom_qty.setValue(0)
+        self._set_row_quantity_to_zero(row)
         QMessageBox.information(self, "Added", f"Added {quantity} unit(s) to cart")
+
+    def on_add_selected_row_to_cart(self) -> None:
+        row = self.selected_product_row
+        if row is None or row < 0 or row >= self.products_table.rowCount():
+            QMessageBox.warning(self, "No row selected", "Please select a row to add to cart.")
+            return
+        product = self.product_row_map.get(row)
+        if not product:
+            QMessageBox.warning(self, "Invalid row", "Selected row does not contain a valid product.")
+            return
+        quantity = self._get_row_quantity(row)
+        if quantity <= 0:
+            QMessageBox.warning(self, "Invalid quantity", "Please choose a valid quantity for the selected row.")
+            return
+        cart_item = self._create_cart_item(product, quantity)
+        self.cart_items.append(cart_item)
+        self._update_cart_table()
+        self._set_row_quantity_to_zero(row)
+        QMessageBox.information(self, "Added", f"Added {quantity} unit(s) to cart")
+
+    def _update_selected_row(self) -> None:
+        self.selected_product_row = self.products_table.currentRow()
 
     def _update_cart_table(self) -> None:
         self.cart_table.setRowCount(len(self.cart_items))
@@ -278,28 +321,16 @@ class OrderDialog(QDialog):
             # Product
             self.cart_table.setItem(row, 2, QTableWidgetItem(str(item.get("product_name") or "")))
             
-            # Pack
-            self.cart_table.setItem(row, 3, QTableWidgetItem(str(item.get("pack") or "")))
-            
             # Qty
-            self.cart_table.setItem(row, 4, QTableWidgetItem(str(item.get("quantity") or 0)))
+            self.cart_table.setItem(row, 3, QTableWidgetItem(str(item.get("quantity") or 0)))
             
-            # CTN Qty
-            self.cart_table.setItem(row, 5, QTableWidgetItem(str(item.get("ctn_qty") or 0)))
-            
-            # Unit Price
-            price = float(item.get("unit_price") or 0.0)
-            self.cart_table.setItem(row, 6, QTableWidgetItem(f"{price:.2f}"))
-            
-            # Total
             total = float(item.get("total_price") or 0.0)
-            self.cart_table.setItem(row, 6, QTableWidgetItem(f"{total:.2f}"))
             total_amount += total
             
             # Remove button
             remove_btn = QPushButton("Remove")
             remove_btn.clicked.connect(lambda checked, r=row: self.on_remove_from_cart(r))
-            self.cart_table.setCellWidget(row, 7, remove_btn)
+            self.cart_table.setCellWidget(row, 4, remove_btn)
         
         self.total_label.setText(f"Cart Total: EUR {total_amount:.2f}")
 
@@ -308,11 +339,17 @@ class OrderDialog(QDialog):
             self.cart_items.pop(row)
             self._update_cart_table()
 
-    def on_generate_order(self) -> None:
+    def on_generate_order(self, format: str = "excel") -> None:
         if not self.cart_items:
             QMessageBox.warning(self, "Empty cart", "Please add items to cart before generating order.")
             return
         
+        if format == "excel":
+            self._export_to_excel()
+        elif format == "pdf":
+            self._export_to_pdf()
+    
+    def _export_to_excel(self) -> None:
         filename = f"{self.vendor}_order_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         order_dir = VENDOR_ROOT / self.vendor / "orders"
         order_dir.mkdir(parents=True, exist_ok=True)
@@ -320,7 +357,7 @@ class OrderDialog(QDialog):
         
         try:
             from pandas import DataFrame
-            
+
             order_data = []
             for item in self.cart_items:
                 order_data.append({
@@ -328,32 +365,142 @@ class OrderDialog(QDialog):
                     "SKU": item.get("sku"),
                     "Product": item.get("product_name"),
                     "Brand": item.get("brand"),
-                    "Pack": item.get("pack"),
-                    "Unit": item.get("unit"),
                     "Quantity": item.get("quantity"),
-                    "CTN Qty": item.get("ctn_qty"),
-                    "Unit Price": item.get("unit_price"),
-                    "Total Price": item.get("total_price"),
                 })
-            
+
             DataFrame(order_data).to_excel(order_path, index=False)
         except Exception as exc:
             QMessageBox.critical(self, "Order creation failed", f"Could not create order Excel sheet:\n{exc}")
             return
-        
-        # Save to database
+
+        # Save or update database
         try:
-            self.db.save_order(
-                vendor=self.vendor,
-                items=self.cart_items,
-                total_amount=sum(item.get("total_price", 0.0) for item in self.cart_items),
-                order_filename=str(order_path),
-                notes=self.notes_input.toPlainText().strip(),
-            )
+            total_amount = sum(item.get("total_price", 0.0) for item in self.cart_items)
+            if getattr(self, "order_id", None):
+                # update existing order
+                try:
+                    self.db.update_order(
+                        self.order_id,
+                        self.cart_items,
+                        total_amount=total_amount,
+                        notes=self.notes_input.toPlainText().strip(),
+                        order_filename=str(order_path),
+                    )
+                except Exception:
+                    # fallback to save as new order if update fails
+                    self.db.save_order(
+                        vendor=self.vendor,
+                        items=self.cart_items,
+                        total_amount=total_amount,
+                        order_filename=str(order_path),
+                        notes=self.notes_input.toPlainText().strip(),
+                    )
+            else:
+                self.db.save_order(
+                    vendor=self.vendor,
+                    items=self.cart_items,
+                    total_amount=total_amount,
+                    order_filename=str(order_path),
+                    notes=self.notes_input.toPlainText().strip(),
+                )
         except Exception as exc:
             QMessageBox.warning(self, "Database save", f"Order Excel saved but DB save failed:\n{exc}")
-        
+
         QMessageBox.information(self, "Order saved", f"Order sheet created:\n{order_path}")
+        self.accept()
+    
+    def _export_to_pdf(self) -> None:
+        try:
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib import colors
+            from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.lib.units import inch
+        except ImportError:
+            QMessageBox.warning(self, "Missing dependency", "Please install reportlab: pip install reportlab")
+            return
+        
+        filename = f"{self.vendor}_order_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        order_dir = VENDOR_ROOT / self.vendor / "orders"
+        order_dir.mkdir(parents=True, exist_ok=True)
+        pdf_path = order_dir / filename
+        
+        try:
+            doc = SimpleDocTemplate(str(pdf_path), pagesize=A4)
+            elements = []
+            styles = getSampleStyleSheet()
+
+            # Header with logo and company details
+            header_style = ParagraphStyle('Header', parent=styles['Normal'], fontSize=10)
+            title_style = ParagraphStyle('Title', parent=styles['Heading1'], fontSize=16, leading=18)
+            # build header table
+            header_data = []
+            logo_path = LOGO_FILE if LOGO_FILE and LOGO_FILE.exists() else None
+            left = []
+            if logo_path:
+                from reportlab.platypus import Image
+
+                try:
+                    img = Image(str(logo_path), width=80, height=40)
+                    left.append(img)
+                except Exception:
+                    left.append(Paragraph(COMPANY_NAME, header_style))
+            else:
+                left.append(Paragraph(COMPANY_NAME, header_style))
+
+            right_lines = [COMPANY_NAME, COMPANY_ADDRESS, f"Tax ID: 01435901405", f"VAT ID: DE365100311"]
+            right = Paragraph("<br/>".join(right_lines), header_style)
+            header_data.append([left, right])
+            header_table = Table(header_data, colWidths=[2.0 * inch, 4.5 * inch])
+            header_table.setStyle(TableStyle([('VALIGN', (0, 0), (-1, -1), 'MIDDLE')]))
+            elements.append(header_table)
+            elements.append(Spacer(1, 0.15 * inch))
+
+            elements.append(Paragraph(f"Order For {self.vendor}", title_style))
+            elements.append(Paragraph(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
+            elements.append(Spacer(1, 0.2 * inch))
+
+            # Table data (no Unit column per request)
+            data = [["SKU", "Brand", "Product", "Qty"]]
+            for item in self.cart_items:
+                data.append([
+                    str(item.get("sku") or ""),
+                    str(item.get("brand") or ""),
+                    str(item.get("product_name") or ""),
+                    str(item.get("quantity") or 0),
+                ])
+
+            table = Table(data, colWidths=[1.2 * inch, 1.2 * inch, 3.6 * inch, 0.8 * inch])
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2c3e50')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.lightgrey]),
+            ]))
+            elements.append(table)
+
+            # Total
+            elements.append(Spacer(1, 0.2 * inch))
+            total_amount = sum(item.get("total_price", 0.0) for item in self.cart_items)
+            elements.append(Paragraph(f"<b>Total: EUR {total_amount:.2f}</b>", styles['Normal']))
+
+            # Notes
+            notes = self.notes_input.toPlainText().strip()
+            if notes:
+                elements.append(Spacer(1, 0.2 * inch))
+                elements.append(Paragraph("<b>Notes:</b>", styles['Normal']))
+                elements.append(Paragraph(notes, styles['Normal']))
+
+            doc.build(elements)
+        except Exception as exc:
+            QMessageBox.critical(self, "PDF export failed", f"Could not create PDF:\n{exc}")
+            return
+        
+        QMessageBox.information(self, "PDF exported", f"Order PDF created:\n{pdf_path}")
         self.accept()
 
 
@@ -435,9 +582,33 @@ class VendorManagerApp(QMainWindow):
 
         orders_box = QGroupBox("Order history")
         orders_layout = QVBoxLayout()
+        # action buttons for selected order
+        orders_btn_row = QHBoxLayout()
+        self.open_order_btn = QPushButton("Open/Edit Selected")
+        self.open_order_btn.clicked.connect(self.on_open_selected_order)
+        orders_btn_row.addWidget(self.open_order_btn)
+        self.export_order_excel_btn = QPushButton("Export Selected (Excel)")
+        self.export_order_excel_btn.clicked.connect(lambda: self.on_export_selected_order("excel"))
+        orders_btn_row.addWidget(self.export_order_excel_btn)
+        self.export_order_pdf_btn = QPushButton("Export Selected (PDF)")
+        self.export_order_pdf_btn.clicked.connect(lambda: self.on_export_selected_order("pdf"))
+        orders_btn_row.addWidget(self.export_order_pdf_btn)
+        self.delete_order_btn = QPushButton("Delete Selected")
+        self.delete_order_btn.clicked.connect(self.on_delete_selected_order)
+        orders_btn_row.addWidget(self.delete_order_btn)
+        # demo order button (for testing)
+        self.create_demo_btn = QPushButton("Create Demo Order")
+        self.create_demo_btn.clicked.connect(self.on_create_demo_order)
+        orders_btn_row.addWidget(self.create_demo_btn)
+        orders_layout.addLayout(orders_btn_row)
+
         self.orders_table = QTableWidget(0, 4)
         self.orders_table.setHorizontalHeaderLabels(["Vendor", "Date", "Total", "Filename"])
         self.orders_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.orders_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.orders_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.orders_table.itemSelectionChanged.connect(self.on_order_selection_changed)
+        self.orders_table.cellDoubleClicked.connect(lambda r, c: self.on_open_selected_order())
         orders_layout.addWidget(self.orders_table)
         orders_box.setLayout(orders_layout)
         right_panel.addWidget(orders_box)
@@ -476,10 +647,23 @@ class VendorManagerApp(QMainWindow):
         for order in orders[:50]:
             index = self.orders_table.rowCount()
             self.orders_table.insertRow(index)
-            self.orders_table.setItem(index, 0, QTableWidgetItem(order["vendor"]))
+            vendor_item = QTableWidgetItem(order["vendor"])
+            vendor_item.setData(Qt.UserRole, order.get("id"))
+            self.orders_table.setItem(index, 0, vendor_item)
             self.orders_table.setItem(index, 1, QTableWidgetItem(order["created_at"]))
             self.orders_table.setItem(index, 2, QTableWidgetItem(f"{order['total_amount']:.2f}"))
             self.orders_table.setItem(index, 3, QTableWidgetItem(order["order_filename"] or ""))
+        # clear selection and disable action buttons until user picks a row
+        self.orders_table.clearSelection()
+        self.on_order_selection_changed()
+
+    def on_order_selection_changed(self) -> None:
+        sel = self.orders_table.currentRow()
+        has = sel is not None and sel >= 0
+        self.open_order_btn.setEnabled(has)
+        self.export_order_excel_btn.setEnabled(has)
+        self.export_order_pdf_btn.setEnabled(has)
+        self.delete_order_btn.setEnabled(has)
 
     def on_vendor_selected(self) -> None:
         selected_items = self.vendor_list.selectedItems()
@@ -584,6 +768,74 @@ class VendorManagerApp(QMainWindow):
         dialog = OrderDialog(self.current_vendor, self.product_cache, self.db, parent=self)
         if dialog.exec_():
             self._load_order_history()
+
+    def _get_selected_order_id(self) -> Optional[int]:
+        sel = self.orders_table.currentRow()
+        if sel < 0:
+            return None
+        item = self.orders_table.item(sel, 0)
+        if not item:
+            return None
+        return item.data(Qt.UserRole)
+
+    def on_open_selected_order(self) -> None:
+        order_id = self._get_selected_order_id()
+        if not order_id:
+            QMessageBox.warning(self, "No order selected", "Please select an order to open.")
+            return
+        # find vendor name from table
+        sel = self.orders_table.currentRow()
+        vendor = self.orders_table.item(sel, 0).text()
+        # load order items
+        items = self.db.get_order_items(order_id)
+        dialog = OrderDialog(vendor, self.db.get_vendor_products(vendor), self.db, parent=self, order_id=order_id, initial_items=items)
+        if dialog.exec_():
+            self._load_order_history()
+
+    def on_export_selected_order(self, format: str = "excel") -> None:
+        order_id = self._get_selected_order_id()
+        if not order_id:
+            QMessageBox.warning(self, "No order selected", "Please select an order to export.")
+            return
+        sel = self.orders_table.currentRow()
+        vendor = self.orders_table.item(sel, 0).text()
+        items = self.db.get_order_items(order_id)
+        dialog = OrderDialog(vendor, self.db.get_vendor_products(vendor), self.db, parent=self, order_id=order_id, initial_items=items)
+        if format == "excel":
+            dialog._export_to_excel()
+        else:
+            dialog._export_to_pdf()
+        self._load_order_history()
+
+    def on_delete_selected_order(self) -> None:
+        order_id = self._get_selected_order_id()
+        if not order_id:
+            QMessageBox.warning(self, "No order selected", "Please select an order to delete.")
+            return
+        resp = QMessageBox.question(self, "Delete order", "Are you sure you want to delete the selected order?", QMessageBox.Yes | QMessageBox.No)
+        if resp != QMessageBox.Yes:
+            return
+        try:
+            self.db.delete_order(order_id)
+            QMessageBox.information(self, "Deleted", "Order deleted")
+            self._load_order_history()
+        except Exception as exc:
+            QMessageBox.warning(self, "Delete failed", f"Could not delete order:\n{exc}")
+
+    def on_create_demo_order(self) -> None:
+        # create a small demo order to populate history for testing
+        vendor = self.current_vendor or (self.vendor_names[0] if self.vendor_names else "demo_vendor")
+        items = [
+            {"sku": "DEMO-001", "product_name": "Sample Milk 1L", "brand": "DemoBrand", "quantity": 10, "ctn_qty": 1, "unit_price": 0.95, "total_price": 9.5},
+            {"sku": "DEMO-002", "product_name": "Sample Bread", "brand": "DemoBake", "quantity": 5, "ctn_qty": 1, "unit_price": 1.2, "total_price": 6.0},
+        ]
+        total = sum(i.get("total_price", 0.0) for i in items)
+        try:
+            order_id = self.db.save_order(vendor=vendor, items=items, total_amount=total, order_filename="", notes="Demo order")
+            QMessageBox.information(self, "Demo order", f"Demo order created with id {order_id}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Demo failed", f"Could not create demo order:\n{exc}")
+        self._load_order_history()
 
 
 def main() -> None:

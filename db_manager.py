@@ -325,3 +325,49 @@ class DatabaseManager:
     def get_order_items(self, order_id: int) -> List[Dict[str, Any]]:
         cursor = self._execute("SELECT * FROM order_items WHERE order_id = ?", (order_id,))
         return [dict(row) for row in cursor.fetchall()]
+
+    def update_order(
+        self,
+        order_id: int,
+        items: List[Dict[str, Any]],
+        total_amount: float,
+        notes: Optional[str] = None,
+        order_filename: Optional[str] = None,
+    ) -> None:
+        """Update an existing order and replace its items with the provided list."""
+        cursor = self.conn.cursor()
+        # Update orders metadata
+        if order_filename is not None:
+            cursor.execute(
+                "UPDATE orders SET total_amount = ?, order_filename = ?, notes = ? WHERE id = ?",
+                (total_amount, order_filename, notes or "", order_id),
+            )
+        else:
+            cursor.execute(
+                "UPDATE orders SET total_amount = ?, notes = ? WHERE id = ?",
+                (total_amount, notes or "", order_id),
+            )
+
+        # Remove existing items and insert new ones
+        cursor.execute("DELETE FROM order_items WHERE order_id = ?", (order_id,))
+        for item in items:
+            sku = str(item.get("sku") or item.get("source_id") or item.get("product_name") or "").strip()
+            product_name = str(item.get("product_name") or "").strip()
+            brand = str(item.get("brand") or "").strip()
+            quantity = int(item.get("quantity") or 0)
+            ctn_qty = int(item.get("ctn_qty") or 0)
+            unit_price = float(item.get("unit_price") or 0.0)
+            total_price = float(item.get("total_price") or 0.0)
+            package = str(item.get("pack") or "").strip()
+            raw_json = json.dumps(item, default=str)
+            cursor.execute(
+                "INSERT INTO order_items (order_id, sku, product_name, brand, quantity, ctn_qty, unit_price, total_price, package, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (order_id, sku, product_name, brand, quantity, ctn_qty, unit_price, total_price, package, raw_json),
+            )
+        self.conn.commit()
+
+    def delete_order(self, order_id: int) -> None:
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM order_items WHERE order_id = ?", (order_id,))
+        cursor.execute("DELETE FROM orders WHERE id = ?", (order_id,))
+        self.conn.commit()

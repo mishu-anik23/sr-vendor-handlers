@@ -23,7 +23,7 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
-    QWidget, QHBoxLayout,
+    QWidget, QHBoxLayout, QSpinBox,
 )
 
 from db_manager import DatabaseManager
@@ -42,139 +42,317 @@ class OrderDialog(QDialog):
         self.vendor = vendor
         self.products = products
         self.db = db
+        self.cart_items: List[Dict] = []  # Store items added to cart
         self.setWindowTitle(f"Create Order - {vendor}")
-        self.setMinimumWidth(540)
-        self.selected_item: Optional[Dict] = None
+        self.setMinimumSize(1200, 800)
         self._build_ui()
-        self._load_products()
+        self._load_products_table()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        self.vendor_label = QLabel(f"Vendor: <b>{self.vendor}</b>")
-        self.product_combo = QComboBox()
-        self.brand_input = QLineEdit()
-        self.quantity_input = QLineEdit("1")
-        self.ctn_qty_input = QLineEdit("1")
-        self.unit_price_input = QLineEdit("0.00")
+        
+        # Header
+        header = QHBoxLayout()
+        header.addWidget(QLabel(f"<b>Vendor:</b> {self.vendor}"))
+        header.addStretch()
+        layout.addLayout(header)
+        
+        # Search and filter panel
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(QLabel("Search Product:"))
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Type product name...")
+        self.search_input.textChanged.connect(self._filter_products)
+        filter_layout.addWidget(self.search_input)
+        
+        filter_layout.addWidget(QLabel("Filter by Brand:"))
+        self.brand_filter = QComboBox()
+        self.brand_filter.addItem("All brands")
+        self._populate_brand_filter()
+        self.brand_filter.currentTextChanged.connect(self._filter_products)
+        filter_layout.addWidget(self.brand_filter)
+        layout.addLayout(filter_layout)
+        
+        # Products table
+        layout.addWidget(QLabel("<b>Available Products</b>"))
+        self.products_table = QTableWidget(0, 10)
+        self.products_table.setHorizontalHeaderLabels(
+            ["SKU", "Brand", "Product", "Pack", "Unit", "CTN Qty", "Price", "Qty (0-10)", "Custom Qty", "Add to Cart"]
+        )
+        header = self.products_table.horizontalHeader()
+        for col in range(self.products_table.columnCount()):
+            header.setSectionResizeMode(col, QHeaderView.Interactive)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        self.products_table.setColumnWidth(0, 140)
+        self.products_table.setColumnWidth(1, 120)
+        self.products_table.setColumnWidth(2, 420)
+        self.products_table.setColumnWidth(3, 120)
+        self.products_table.setColumnWidth(4, 80)
+        self.products_table.setColumnWidth(5, 90)
+        self.products_table.setColumnWidth(6, 100)
+        self.products_table.setColumnWidth(7, 90)
+        self.products_table.setColumnWidth(8, 100)
+        self.products_table.setColumnWidth(9, 100)
+        layout.addWidget(self.products_table)
+        
+        # Cart section
+        layout.addWidget(QLabel("<b>Order Cart</b>"))
+        self.cart_table = QTableWidget(0, 9)
+        self.cart_table.setHorizontalHeaderLabels(
+            ["SKU", "Brand", "Product", "Pack", "Qty", "CTN Qty", "Unit Price", "Total", "Remove"]
+        )
+        header = self.cart_table.horizontalHeader()
+        for col in range(self.cart_table.columnCount()):
+            header.setSectionResizeMode(col, QHeaderView.Interactive)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        self.cart_table.setColumnWidth(0, 140)
+        self.cart_table.setColumnWidth(1, 120)
+        self.cart_table.setColumnWidth(2, 420)
+        self.cart_table.setColumnWidth(3, 120)
+        self.cart_table.setColumnWidth(4, 80)
+        self.cart_table.setColumnWidth(5, 90)
+        self.cart_table.setColumnWidth(6, 100)
+        self.cart_table.setColumnWidth(7, 120)
+        layout.addWidget(self.cart_table)
+        
+        # Total and buttons
+        bottom_layout = QHBoxLayout()
+        self.total_label = QLabel("Cart Total: EUR 0.00")
+        self.total_label.setStyleSheet("font-weight: bold; font-size: 12pt;")
+        bottom_layout.addWidget(self.total_label)
+        bottom_layout.addStretch()
+        
         self.notes_input = QTextEdit()
         self.notes_input.setPlaceholderText("Order notes or instructions")
-        self.total_label = QLabel("Total: 0.00")
-        self.order_button = QPushButton("Generate Order Sheet")
-        self.order_button.clicked.connect(self.on_generate_order)
+        self.notes_input.setMaximumHeight(80)
+        
+        button_layout = QVBoxLayout()
+        button_layout.addWidget(QLabel("Notes:"))
+        button_layout.addWidget(self.notes_input)
+        
+        button_row = QHBoxLayout()
+        self.generate_button = QPushButton("Generate Order Sheet")
+        self.generate_button.clicked.connect(self.on_generate_order)
+        button_row.addWidget(self.generate_button)
+        
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.reject)
+        button_row.addWidget(self.cancel_button)
+        
+        button_layout.addLayout(button_row)
+        bottom_layout.addLayout(button_layout)
+        layout.addLayout(bottom_layout)
 
-        self.product_combo.currentIndexChanged.connect(self.on_product_changed)
-        self.quantity_input.textChanged.connect(self._update_total)
-        self.ctn_qty_input.textChanged.connect(self._update_total)
-        self.unit_price_input.textChanged.connect(self._update_total)
-
-        grid = QGridLayout()
-        grid.addWidget(self.vendor_label, 0, 0, 1, 2)
-        grid.addWidget(QLabel("Product:"), 1, 0)
-        grid.addWidget(self.product_combo, 1, 1)
-        grid.addWidget(QLabel("Brand:"), 2, 0)
-        grid.addWidget(self.brand_input, 2, 1)
-        grid.addWidget(QLabel("Quantity:"), 3, 0)
-        grid.addWidget(self.quantity_input, 3, 1)
-        grid.addWidget(QLabel("CTN Qty:"), 4, 0)
-        grid.addWidget(self.ctn_qty_input, 4, 1)
-        grid.addWidget(QLabel("Unit Price:"), 5, 0)
-        grid.addWidget(self.unit_price_input, 5, 1)
-        grid.addWidget(QLabel("Notes:"), 6, 0)
-        grid.addWidget(self.notes_input, 6, 1)
-        grid.addWidget(self.total_label, 7, 0, 1, 2)
-        grid.addWidget(self.order_button, 8, 0, 1, 2)
-
-        layout.addLayout(grid)
-
-    def _load_products(self) -> None:
-        self.product_combo.clear()
+    def _populate_brand_filter(self) -> None:
+        brands = set()
         for product in self.products:
-            name = product.get("product_name") or "Unnamed product"
-            self.product_combo.addItem(name, product)
-        if self.products:
-            self.product_combo.setCurrentIndex(0)
-            self.on_product_changed(0)
+            brand = product.get("brand")
+            if brand:
+                brands.add(str(brand))
+        for brand in sorted(brands):
+            self.brand_filter.addItem(brand)
 
-    def on_product_changed(self, index: int) -> None:
-        product = self.product_combo.itemData(index)
+    def _load_products_table(self) -> None:
+        self.products_table.setRowCount(len(self.products))
+        self.product_row_map = {}  # Map row index to product
+        for row, product in enumerate(self.products):
+            self.product_row_map[row] = product
+            
+            # SKU
+            sku = str(product.get("sku") or "")
+            self.products_table.setItem(row, 0, QTableWidgetItem(sku))
+            
+            # Brand
+            brand = str(product.get("brand") or "")
+            self.products_table.setItem(row, 1, QTableWidgetItem(brand))
+            
+            # Product name
+            product_name = str(product.get("product_name") or "")
+            self.products_table.setItem(row, 2, QTableWidgetItem(product_name))
+            
+            # Pack
+            pack = str(product.get("pack") or "")
+            self.products_table.setItem(row, 3, QTableWidgetItem(pack))
+            
+            # Unit
+            unit = str(product.get("unit") or "")
+            self.products_table.setItem(row, 4, QTableWidgetItem(unit))
+            
+            # CTN Qty
+            ctn_qty = str(product.get("ctn_qty") or 0)
+            self.products_table.setItem(row, 5, QTableWidgetItem(ctn_qty))
+            
+            # Price
+            price = float(product.get("price") or 0.0)
+            self.products_table.setItem(row, 6, QTableWidgetItem(f"{price:.2f}"))
+            
+            # Qty dropdown (0-10)
+            qty_combo = QComboBox()
+            qty_combo.addItems([str(i) for i in range(11)])
+            qty_combo.setCurrentText("0")
+            self.products_table.setCellWidget(row, 6, qty_combo)
+            
+            # Custom qty input
+            custom_qty = QSpinBox()
+            custom_qty.setMinimum(0)
+            custom_qty.setMaximum(10000)
+            custom_qty.setValue(0)
+            self.products_table.setCellWidget(row, 7, custom_qty)
+            
+            # Add to cart button
+            add_btn = QPushButton("Add")
+            add_btn.clicked.connect(lambda checked, r=row: self.on_add_to_cart(r))
+            self.products_table.setCellWidget(row, 8, add_btn)
+
+    def _filter_products(self) -> None:
+        search_text = self.search_input.text().lower()
+        selected_brand = self.brand_filter.currentText()
+        
+        for row in range(self.products_table.rowCount()):
+            product = self.product_row_map.get(row)
+            if not product:
+                continue
+            
+            # Check search text match
+            product_name = str(product.get("product_name") or "").lower()
+            matches_search = search_text == "" or search_text in product_name
+            
+            # Check brand filter match
+            brand = str(product.get("brand") or "")
+            matches_brand = selected_brand == "All brands" or brand == selected_brand
+            
+            # Show/hide row
+            show_row = matches_search and matches_brand
+            self.products_table.setRowHidden(row, not show_row)
+
+    def on_add_to_cart(self, row: int) -> None:
+        product = self.product_row_map.get(row)
         if not product:
             return
-        self.selected_item = product
-        self.brand_input.setText(str(product.get("brand") or ""))
-        self.quantity_input.setText(str(product.get("stock") or "1"))
-        self.ctn_qty_input.setText(str(product.get("ctn_qty") or "1"))
-        self.unit_price_input.setText(f"{product.get('price') or 0.0:.2f}")
-        self._update_total()
+        
+        qty_combo = self.products_table.cellWidget(row, 6)
+        custom_qty = self.products_table.cellWidget(row, 7)
+        
+        qty_0_10 = int(qty_combo.currentText() or 0)
+        custom_qty_val = custom_qty.value() if custom_qty else 0
+        
+        # Use custom qty if > 10, otherwise use combo selection
+        quantity = custom_qty_val if custom_qty_val > 10 else qty_0_10
+        
+        if quantity <= 0:
+            QMessageBox.warning(self, "Invalid quantity", "Please select a quantity > 0")
+            return
+        
+        # Add to cart
+        cart_item = {
+            "sku": product.get("sku"),
+            "product_name": product.get("product_name"),
+            "brand": product.get("brand"),
+            "pack": product.get("pack"),
+            "unit": product.get("unit"),
+            "ctn_qty": product.get("ctn_qty") or 0,
+            "unit_price": product.get("price") or 0.0,
+            "quantity": quantity,
+            "total_price": quantity * (product.get("ctn_qty") or 1) * (product.get("price") or 0.0),
+            "extra_json": product.get("extra_json"),
+        }
+        self.cart_items.append(cart_item)
+        self._update_cart_table()
+        
+        # Reset inputs
+        qty_combo.setCurrentText("0")
+        custom_qty.setValue(0)
+        QMessageBox.information(self, "Added", f"Added {quantity} unit(s) to cart")
 
-    def _update_total(self) -> None:
-        try:
-            quantity = int(self.quantity_input.text() or 0)
-        except ValueError:
-            quantity = 0
-        try:
-            ctn_qty = int(self.ctn_qty_input.text() or 0)
-        except ValueError:
-            ctn_qty = 0
-        try:
-            unit_price = float(self.unit_price_input.text() or 0.0)
-        except ValueError:
-            unit_price = 0.0
-        total = (quantity * ctn_qty) * unit_price
-        self.total_label.setText(f"Total: {total:.2f}")
+    def _update_cart_table(self) -> None:
+        self.cart_table.setRowCount(len(self.cart_items))
+        total_amount = 0.0
+        
+        for row, item in enumerate(self.cart_items):
+            # SKU
+            self.cart_table.setItem(row, 0, QTableWidgetItem(str(item.get("sku") or "")))
+            
+            # Brand
+            self.cart_table.setItem(row, 1, QTableWidgetItem(str(item.get("brand") or "")))
+            
+            # Product
+            self.cart_table.setItem(row, 2, QTableWidgetItem(str(item.get("product_name") or "")))
+            
+            # Pack
+            self.cart_table.setItem(row, 3, QTableWidgetItem(str(item.get("pack") or "")))
+            
+            # Qty
+            self.cart_table.setItem(row, 4, QTableWidgetItem(str(item.get("quantity") or 0)))
+            
+            # CTN Qty
+            self.cart_table.setItem(row, 5, QTableWidgetItem(str(item.get("ctn_qty") or 0)))
+            
+            # Unit Price
+            price = float(item.get("unit_price") or 0.0)
+            self.cart_table.setItem(row, 6, QTableWidgetItem(f"{price:.2f}"))
+            
+            # Total
+            total = float(item.get("total_price") or 0.0)
+            self.cart_table.setItem(row, 6, QTableWidgetItem(f"{total:.2f}"))
+            total_amount += total
+            
+            # Remove button
+            remove_btn = QPushButton("Remove")
+            remove_btn.clicked.connect(lambda checked, r=row: self.on_remove_from_cart(r))
+            self.cart_table.setCellWidget(row, 7, remove_btn)
+        
+        self.total_label.setText(f"Cart Total: EUR {total_amount:.2f}")
+
+    def on_remove_from_cart(self, row: int) -> None:
+        if 0 <= row < len(self.cart_items):
+            self.cart_items.pop(row)
+            self._update_cart_table()
 
     def on_generate_order(self) -> None:
-        if self.selected_item is None:
-            QMessageBox.warning(self, "No product", "Please select a product to order.")
+        if not self.cart_items:
+            QMessageBox.warning(self, "Empty cart", "Please add items to cart before generating order.")
             return
-        try:
-            quantity = int(self.quantity_input.text() or 0)
-            ctn_qty = int(self.ctn_qty_input.text() or 0)
-            unit_price = float(self.unit_price_input.text() or 0.0)
-        except ValueError:
-            QMessageBox.warning(self, "Invalid input", "Please enter valid numeric values for quantity, CTN quantity, and unit price.")
-            return
-        order_item = {
-            "sku": self.selected_item.get("sku") or self.selected_item.get("source_id"),
-            "product_name": self.selected_item.get("product_name"),
-            "brand": self.brand_input.text().strip() or self.selected_item.get("brand"),
-            "quantity": quantity,
-            "ctn_qty": ctn_qty,
-            "unit_price": unit_price,
-            "total_price": quantity * ctn_qty * unit_price,
-            "pack": self.selected_item.get("pack"),
-            "raw_json": self.selected_item.get("extra_json"),
-        }
-        order_rows = [order_item]
+        
         filename = f"{self.vendor}_order_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         order_dir = VENDOR_ROOT / self.vendor / "orders"
         order_dir.mkdir(parents=True, exist_ok=True)
         order_path = order_dir / filename
+        
         try:
             from pandas import DataFrame
-
-            DataFrame(
-                [
-                    {
-                        "Vendor": self.vendor,
-                        "Product": order_item["product_name"],
-                        "Brand": order_item["brand"],
-                        "Quantity": order_item["quantity"],
-                        "CTN Qty": order_item["ctn_qty"],
-                        "Unit Price": order_item["unit_price"],
-                        "Total Price": order_item["total_price"],
-                    }
-                ]
-            ).to_excel(order_path, index=False)
+            
+            order_data = []
+            for item in self.cart_items:
+                order_data.append({
+                    "Vendor": self.vendor,
+                    "SKU": item.get("sku"),
+                    "Product": item.get("product_name"),
+                    "Brand": item.get("brand"),
+                    "Pack": item.get("pack"),
+                    "Unit": item.get("unit"),
+                    "Quantity": item.get("quantity"),
+                    "CTN Qty": item.get("ctn_qty"),
+                    "Unit Price": item.get("unit_price"),
+                    "Total Price": item.get("total_price"),
+                })
+            
+            DataFrame(order_data).to_excel(order_path, index=False)
         except Exception as exc:
             QMessageBox.critical(self, "Order creation failed", f"Could not create order Excel sheet:\n{exc}")
             return
-        self.db.save_order(
-            vendor=self.vendor,
-            items=[order_item],
-            total_amount=order_item["total_price"],
-            order_filename=str(order_path),
-            notes=self.notes_input.toPlainText().strip(),
-        )
+        
+        # Save to database
+        try:
+            self.db.save_order(
+                vendor=self.vendor,
+                items=self.cart_items,
+                total_amount=sum(item.get("total_price", 0.0) for item in self.cart_items),
+                order_filename=str(order_path),
+                notes=self.notes_input.toPlainText().strip(),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Database save", f"Order Excel saved but DB save failed:\n{exc}")
+        
         QMessageBox.information(self, "Order saved", f"Order sheet created:\n{order_path}")
         self.accept()
 
@@ -231,19 +409,28 @@ class VendorManagerApp(QMainWindow):
         stats_box = QGroupBox("Statistics")
         stats_layout = QVBoxLayout()
         self.stats_label = QLabel("Select a vendor or sync products to see statistics.")
-        self.stats_table = QTableWidget(0, 3)
-        self.stats_table.setHorizontalHeaderLabels(["Vendor", "Products", "Inventory value"])
+        self.stats_table = QTableWidget(0, 5)
+        self.stats_table.setHorizontalHeaderLabels(["Vendor", "Products", "Inventory value", "Barcodes", "SR-SKUs"])
         self.stats_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         stats_layout.addWidget(self.stats_label)
         stats_layout.addWidget(self.stats_table)
         stats_box.setLayout(stats_layout)
         right_panel.addWidget(stats_box)
 
-        self.product_table = QTableWidget(0, 8)
+        self.product_table = QTableWidget(0, 10)
         self.product_table.setHorizontalHeaderLabels(
-            ["SKU", "Product", "Brand", "Pack", "Unit", "CTN Qty", "Price", "Stock"]
+            ["SKU", "Product", "Brand", "Pack", "Unit", "CTN Qty", "Price", "Stock", "Barcode", "SR-SKU"]
         )
-        self.product_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        header = self.product_table.horizontalHeader()
+        for col in range(self.product_table.columnCount()):
+            header.setSectionResizeMode(col, QHeaderView.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        self.product_table.setColumnWidth(1, 520)
+        self.product_table.setColumnWidth(3, 120)
+        self.product_table.setColumnWidth(4, 80)
+        self.product_table.setColumnWidth(5, 90)
+        self.product_table.setColumnWidth(8, 140)
+        self.product_table.setColumnWidth(9, 180)
         right_panel.addWidget(self.product_table)
 
         orders_box = QGroupBox("Order history")
@@ -276,6 +463,8 @@ class VendorManagerApp(QMainWindow):
             self.stats_table.setItem(index, 0, QTableWidgetItem(row["vendor"]))
             self.stats_table.setItem(index, 1, QTableWidgetItem(str(row["product_count"])))
             self.stats_table.setItem(index, 2, QTableWidgetItem(f"{row['inventory_value']:.2f}"))
+            self.stats_table.setItem(index, 3, QTableWidgetItem(str(row.get("barcode_count") or 0)))
+            self.stats_table.setItem(index, 4, QTableWidgetItem(str(row.get("srsku_count") or 0)))
             total_products += row["product_count"]
             total_value += row["inventory_value"]
         self.stats_label.setText(f"{len(stats)} vendors, {total_products} total products, inventory value €{total_value:.2f}")
@@ -314,6 +503,8 @@ class VendorManagerApp(QMainWindow):
             self.product_table.setItem(index, 5, QTableWidgetItem(str(product.get("ctn_qty") or "0")))
             self.product_table.setItem(index, 6, QTableWidgetItem(f"{product.get('price') or 0.0:.2f}"))
             self.product_table.setItem(index, 7, QTableWidgetItem(str(product.get("stock") or "")))
+            self.product_table.setItem(index, 8, QTableWidgetItem(str(product.get("barcode") or "")))
+            self.product_table.setItem(index, 9, QTableWidgetItem(str(product.get("sr_sku") or "")))
         if self.current_vendor:
             stats = self.db.get_vendor_statistics(self.current_vendor)
             self.stats_label.setText(

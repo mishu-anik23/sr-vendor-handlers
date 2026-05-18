@@ -78,6 +78,8 @@ class DatabaseManager:
                 ctn_qty INTEGER,
                 price REAL,
                 stock TEXT,
+                barcode TEXT,
+                sr_sku TEXT,
                 last_updated TEXT,
                 extra_json TEXT
             )
@@ -87,6 +89,10 @@ class DatabaseManager:
         # ensure sku column and unique index exist for this vendor table (migrate older tables)
         self._ensure_column_on_table(table_name, "sku")
         self._ensure_unique_index(table_name, "sku")
+        # ensure barcode and sr_sku columns/index
+        self._ensure_column_on_table(table_name, "barcode")
+        self._ensure_column_on_table(table_name, "sr_sku")
+        self._ensure_unique_index(table_name, "sr_sku")
         # migrate any legacy source_id values to sku for this vendor table
         self._migrate_source_id_to_sku(table_name)
         # consolidate SKUs from extra_json/raw_excel when possible
@@ -107,14 +113,16 @@ class DatabaseManager:
             ctn_qty = int(product.get("ctn_qty") or 0)
             price = float(product.get("price") or 0.0)
             stock = str(product.get("stock") or "").strip()
+            barcode = str(product.get("barcode") or "").strip()
+            sr_sku = str(product.get("sr_sku") or "").strip()
             last_updated = product.get("last_updated") or datetime.utcnow().isoformat()
             extra_json = json.dumps(product, default=str)
             try:
                 cursor.execute(
                     f"""
                     INSERT INTO `{table_name}`
-                        (sku, product_name, brand, pack, unit, ctn_qty, price, stock, last_updated, extra_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (sku, product_name, brand, pack, unit, ctn_qty, price, stock, barcode, sr_sku, last_updated, extra_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(sku) DO UPDATE SET
                         product_name=excluded.product_name,
                         brand=excluded.brand,
@@ -123,10 +131,12 @@ class DatabaseManager:
                         ctn_qty=excluded.ctn_qty,
                         price=excluded.price,
                         stock=excluded.stock,
+                        barcode=excluded.barcode,
+                        sr_sku=excluded.sr_sku,
                         last_updated=excluded.last_updated,
                         extra_json=excluded.extra_json
                     """,
-                    (sku, product_name, brand, pack, unit, ctn_qty, price, stock, last_updated, extra_json),
+                    (sku, product_name, brand, pack, unit, ctn_qty, price, stock, barcode, sr_sku, last_updated, extra_json),
                 )
             except sqlite3.IntegrityError:
                 # Fallback for edge cases: perform explicit UPDATE
@@ -146,13 +156,15 @@ class DatabaseManager:
         table_name = self.vendor_table_name(vendor)
         self.create_vendor_table(vendor)
         cursor = self._execute(
-            f"SELECT COUNT(*) AS product_count, SUM(ctn_qty * price) AS inventory_value FROM `{table_name}`"
+            f"SELECT COUNT(*) AS product_count, SUM(ctn_qty * price) AS inventory_value, SUM(CASE WHEN barcode IS NOT NULL AND barcode != '' THEN 1 ELSE 0 END) AS barcode_count, COUNT(DISTINCT sr_sku) AS srsku_count FROM `{table_name}`"
         )
         row = cursor.fetchone()
         return {
             "vendor": vendor,
             "product_count": int(row["product_count"] or 0),
             "inventory_value": float(row["inventory_value"] or 0.0),
+            "barcode_count": int(row["barcode_count"] or 0),
+            "srsku_count": int(row["srsku_count"] or 0),
         }
 
     def get_all_vendor_statistics(self, vendors: List[str]) -> List[Dict[str, Any]]:

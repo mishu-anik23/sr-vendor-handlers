@@ -101,11 +101,56 @@ class ExcelLoader:
                 "last_updated": datetime.utcnow().isoformat(),
                 "raw_excel": row.to_dict(),
             }
+            # If pack or unit missing, try to parse from product_name
+            pack_missing = (not item.get("pack") or str(item.get("pack")).lower() in ("nan", "none", ""))
+            unit_missing = (not item.get("unit") or str(item.get("unit")).lower() in ("nan", "none", ""))
+            if pack_missing or unit_missing:
+                parsed_pack, parsed_unit = self._parse_pack_unit(item.get("product_name") or "")
+                if parsed_pack and pack_missing:
+                    item["pack"] = parsed_pack
+                if parsed_unit and unit_missing:
+                    item["unit"] = parsed_unit
+
             if not item["sku"] and item["product_name"]:
                 item["sku"] = item["product_name"]
             if item["product_name"]:
                 products.append(item)
         return products
+
+    @staticmethod
+    def _normalize_unit(unit: str) -> str:
+        if not unit:
+            return ""
+        u = unit.strip().lower()
+        u = u.replace("gm", "g").replace("gr", "g").replace("kgs", "kg").replace("ltr", "l")
+        u = u.replace("pcs", "pcs").replace("pc", "pcs")
+        return u
+
+    def _parse_pack_unit(self, name: str) -> (str, str):
+        """Extract a pack string and unit from a product name.
+
+        Examples matched: '6x330ml', '500 g', '1 kg', '12 pcs', '2 x 400 ml'
+        Returns (pack, unit) where either may be empty string if not found.
+        """
+        if not name:
+            return "", ""
+        text = str(name)
+        # try pattern like 6x330ml or 2 x 400 ml
+        m = re.search(r"(\d+)\s*[xX]\s*(\d+(?:[\.,]\d+)?)\s*(kg|g|gm|gr|ml|l|ltr|pcs|pc)\b", text)
+        if m:
+            n1 = m.group(1)
+            n2 = m.group(2).replace(",", ".")
+            unit = self._normalize_unit(m.group(3))
+            pack = f"{n1}x{n2}{unit}"
+            return pack, unit
+        # try single quantity unit like 500 g, 250ml, 1kg
+        m2 = re.search(r"(\d+(?:[\.,]\d+)?)\s*(kg|g|gm|gr|ml|l|ltr|pcs|pc)\b", text)
+        if m2:
+            qty = m2.group(1).replace(",", ".")
+            unit = self._normalize_unit(m2.group(2))
+            pack = f"{qty}{unit}"
+            return pack, unit
+        return "", ""
 
     @staticmethod
     def _is_int_like(value: Any) -> bool:

@@ -61,6 +61,8 @@ class DatabaseManager:
         self.conn.commit()
         # ensure sku column exists on order_items for older DBs
         self._ensure_column_on_order_items("sku")
+        # migrate any legacy source_id values to sku on order_items
+        self._migrate_order_items_source_id()
 
     def create_vendor_table(self, vendor: str) -> None:
         table_name = self.vendor_table_name(vendor)
@@ -85,6 +87,8 @@ class DatabaseManager:
         # ensure sku column and unique index exist for this vendor table (migrate older tables)
         self._ensure_column_on_table(table_name, "sku")
         self._ensure_unique_index(table_name, "sku")
+        # migrate any legacy source_id values to sku for this vendor table
+        self._migrate_source_id_to_sku(table_name)
 
     def upsert_vendor_products(self, vendor: str, products: List[Dict[str, Any]]) -> None:
         self.create_vendor_table(vendor)
@@ -103,24 +107,31 @@ class DatabaseManager:
             stock = str(product.get("stock") or "").strip()
             last_updated = product.get("last_updated") or datetime.utcnow().isoformat()
             extra_json = json.dumps(product, default=str)
-            cursor.execute(
-                f"""
-                INSERT INTO `{table_name}`
-                    (sku, product_name, brand, pack, unit, ctn_qty, price, stock, last_updated, extra_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(sku) DO UPDATE SET
-                    product_name=excluded.product_name,
-                    brand=excluded.brand,
-                    pack=excluded.pack,
-                    unit=excluded.unit,
-                    ctn_qty=excluded.ctn_qty,
-                    price=excluded.price,
-                    stock=excluded.stock,
-                    last_updated=excluded.last_updated,
-                    extra_json=excluded.extra_json
-                """,
-                (sku, product_name, brand, pack, unit, ctn_qty, price, stock, last_updated, extra_json),
-            )
+            try:
+                cursor.execute(
+                    f"""
+                    INSERT INTO `{table_name}`
+                        (sku, product_name, brand, pack, unit, ctn_qty, price, stock, last_updated, extra_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(sku) DO UPDATE SET
+                        product_name=excluded.product_name,
+                        brand=excluded.brand,
+                        pack=excluded.pack,
+                        unit=excluded.unit,
+                        ctn_qty=excluded.ctn_qty,
+                        price=excluded.price,
+                        stock=excluded.stock,
+                        last_updated=excluded.last_updated,
+                        extra_json=excluded.extra_json
+                    """,
+                    (sku, product_name, brand, pack, unit, ctn_qty, price, stock, last_updated, extra_json),
+                )
+            except sqlite3.IntegrityError:
+                # Fallback for edge cases: perform explicit UPDATE
+                cursor.execute(
+                    f"UPDATE `{table_name}` SET product_name=?, brand=?, pack=?, unit=?, ctn_qty=?, price=?, stock=?, last_updated=?, extra_json=? WHERE sku=?",
+                    (product_name, brand, pack, unit, ctn_qty, price, stock, last_updated, extra_json, sku),
+                )
         self.conn.commit()
 
     def get_vendor_products(self, vendor: str) -> List[Dict[str, Any]]:
@@ -198,6 +209,50 @@ class DatabaseManager:
         cols = [r[1] for r in cursor.fetchall()]
         if column not in cols:
             cursor.execute(f"ALTER TABLE order_items ADD COLUMN {column} TEXT")
+            self.conn.commit()
+
+    def _migrate_source_id_to_sku(self, table_name: str) -> None:
+        # If the legacy `source_id` column exists, copy its values into `sku` where missing.
+        cursor = self.conn.cursor()
+        cursor.execute(f"PRAGMA table_info(`{table_name}`)")
+        cols = [r[1] for r in cursor.fetchall()]
+        if "source_id" in cols and "sku" in cols:
+            cursor.execute(f"SELECT id, source_id FROM `{table_name}` WHERE (sku IS NULL OR sku = '') AND (source_id IS NOT NULL AND source_id != '')")
+            rows = cursor.fetchall()
+            for r in rows:
+                row_id = r[0]
+                source_id = r[1]
+                if not source_id:
+                    continue
+                cursor.execute(f"SELECT COUNT(1) FROM `{table_name}` WHERE sku = ?", (source_id,))
+                count = cursor.fetchone()[0]
+                if count == 0:
+                    cursor.execute(f"UPDATE `{table_name}` SET sku = ? WHERE id = ?", (source_id, row_id))
+                else:
+                    # make a unique fallback sku using row id
+                    fallback = f"{source_id}_{row_id}"
+                    cursor.execute(f"UPDATE `{table_name}` SET sku = ? WHERE id = ?", (fallback, row_id))
+            self.conn.commit()
+
+    def _migrate_order_items_source_id(self) -> None:
+        cursor = self.conn.cursor()
+        cursor.execute("PRAGMA table_info(order_items)")
+        cols = [r[1] for r in cursor.fetchall()]
+        if "source_id" in cols and "sku" in cols:
+            cursor.execute("SELECT id, source_id FROM order_items WHERE (sku IS NULL OR sku = '') AND (source_id IS NOT NULL AND source_id != '')")
+            rows = cursor.fetchall()
+            for r in rows:
+                row_id = r[0]
+                source_id = r[1]
+                if not source_id:
+                    continue
+                cursor.execute("SELECT COUNT(1) FROM order_items WHERE sku = ?", (source_id,))
+                count = cursor.fetchone()[0]
+                if count == 0:
+                    cursor.execute("UPDATE order_items SET sku = ? WHERE id = ?", (source_id, row_id))
+                else:
+                    fallback = f"{source_id}_{row_id}"
+                    cursor.execute("UPDATE order_items SET sku = ? WHERE id = ?", (fallback, row_id))
             self.conn.commit()
 
     def get_orders(self, vendor: Optional[str] = None) -> List[Dict[str, Any]]:

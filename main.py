@@ -23,7 +23,7 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
-    QWidget,
+    QWidget, QHBoxLayout,
 )
 
 from db_manager import DatabaseManager
@@ -134,7 +134,7 @@ class OrderDialog(QDialog):
             QMessageBox.warning(self, "Invalid input", "Please enter valid numeric values for quantity, CTN quantity, and unit price.")
             return
         order_item = {
-            "source_id": self.selected_item.get("source_id"),
+            "sku": self.selected_item.get("sku") or self.selected_item.get("source_id"),
             "product_name": self.selected_item.get("product_name"),
             "brand": self.brand_input.text().strip() or self.selected_item.get("brand"),
             "quantity": quantity,
@@ -305,7 +305,7 @@ class VendorManagerApp(QMainWindow):
         for product in self.product_cache:
             index = self.product_table.rowCount()
             self.product_table.insertRow(index)
-            self.product_table.setItem(index, 0, QTableWidgetItem(str(product.get("source_id") or "")))
+            self.product_table.setItem(index, 0, QTableWidgetItem(str(product.get("sku") or "")))
             self.product_table.setItem(index, 1, QTableWidgetItem(str(product.get("product_name") or "")))
             self.product_table.setItem(index, 2, QTableWidgetItem(str(product.get("brand") or "")))
             self.product_table.setItem(index, 3, QTableWidgetItem(str(product.get("pack") or "")))

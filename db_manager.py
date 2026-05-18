@@ -45,7 +45,7 @@ class DatabaseManager:
             CREATE TABLE IF NOT EXISTS order_items (
                 id INTEGER PRIMARY KEY,
                 order_id INTEGER NOT NULL,
-                source_id TEXT,
+                sku TEXT,
                 product_name TEXT,
                 brand TEXT,
                 quantity INTEGER,
@@ -59,6 +59,8 @@ class DatabaseManager:
             """
         )
         self.conn.commit()
+        # ensure sku column exists on order_items for older DBs
+        self._ensure_column_on_order_items("sku")
 
     def create_vendor_table(self, vendor: str) -> None:
         table_name = self.vendor_table_name(vendor)
@@ -66,7 +68,7 @@ class DatabaseManager:
             f"""
             CREATE TABLE IF NOT EXISTS `{table_name}` (
                 id INTEGER PRIMARY KEY,
-                source_id TEXT UNIQUE,
+                sku TEXT,
                 product_name TEXT,
                 brand TEXT,
                 pack TEXT,
@@ -80,14 +82,17 @@ class DatabaseManager:
             """
         )
         self.conn.commit()
+        # ensure sku column and unique index exist for this vendor table (migrate older tables)
+        self._ensure_column_on_table(table_name, "sku")
+        self._ensure_unique_index(table_name, "sku")
 
     def upsert_vendor_products(self, vendor: str, products: List[Dict[str, Any]]) -> None:
         self.create_vendor_table(vendor)
         table_name = self.vendor_table_name(vendor)
         cursor = self.conn.cursor()
         for product in products:
-            source_id = str(product.get("source_id") or product.get("product_name") or "").strip()
-            if not source_id:
+            sku = str(product.get("sku") or product.get("source_id") or product.get("product_name") or "").strip()
+            if not sku:
                 continue
             product_name = str(product.get("product_name") or "").strip()
             brand = str(product.get("brand") or "").strip()
@@ -101,9 +106,9 @@ class DatabaseManager:
             cursor.execute(
                 f"""
                 INSERT INTO `{table_name}`
-                    (source_id, product_name, brand, pack, unit, ctn_qty, price, stock, last_updated, extra_json)
+                    (sku, product_name, brand, pack, unit, ctn_qty, price, stock, last_updated, extra_json)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(source_id) DO UPDATE SET
+                ON CONFLICT(sku) DO UPDATE SET
                     product_name=excluded.product_name,
                     brand=excluded.brand,
                     pack=excluded.pack,
@@ -114,7 +119,7 @@ class DatabaseManager:
                     last_updated=excluded.last_updated,
                     extra_json=excluded.extra_json
                 """,
-                (source_id, product_name, brand, pack, unit, ctn_qty, price, stock, last_updated, extra_json),
+                (sku, product_name, brand, pack, unit, ctn_qty, price, stock, last_updated, extra_json),
             )
         self.conn.commit()
 
@@ -156,7 +161,7 @@ class DatabaseManager:
         )
         order_id = cursor.lastrowid
         for item in items:
-            source_id = str(item.get("source_id") or item.get("product_name") or "").strip()
+            sku = str(item.get("sku") or item.get("source_id") or item.get("product_name") or "").strip()
             product_name = str(item.get("product_name") or "").strip()
             brand = str(item.get("brand") or "").strip()
             quantity = int(item.get("quantity") or 0)
@@ -166,11 +171,34 @@ class DatabaseManager:
             package = str(item.get("pack") or "").strip()
             raw_json = json.dumps(item, default=str)
             cursor.execute(
-                "INSERT INTO order_items (order_id, source_id, product_name, brand, quantity, ctn_qty, unit_price, total_price, package, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (order_id, source_id, product_name, brand, quantity, ctn_qty, unit_price, total_price, package, raw_json),
+                "INSERT INTO order_items (order_id, sku, product_name, brand, quantity, ctn_qty, unit_price, total_price, package, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (order_id, sku, product_name, brand, quantity, ctn_qty, unit_price, total_price, package, raw_json),
             )
         self.conn.commit()
         return order_id
+
+    def _ensure_column_on_table(self, table_name: str, column: str) -> None:
+        # check if column exists, if not add it
+        cursor = self.conn.cursor()
+        cursor.execute(f"PRAGMA table_info(`{table_name}`)")
+        cols = [r[1] for r in cursor.fetchall()]
+        if column not in cols:
+            cursor.execute(f"ALTER TABLE `{table_name}` ADD COLUMN {column} TEXT")
+            self.conn.commit()
+
+    def _ensure_unique_index(self, table_name: str, column: str) -> None:
+        # create a unique index if it doesn't exist (used for ON CONFLICT upserts)
+        index_name = f"idx_{table_name}_{column}"
+        self._execute(f"CREATE UNIQUE INDEX IF NOT EXISTS `{index_name}` ON `{table_name}`(`{column}`)")
+        self.conn.commit()
+
+    def _ensure_column_on_order_items(self, column: str) -> None:
+        cursor = self.conn.cursor()
+        cursor.execute("PRAGMA table_info(order_items)")
+        cols = [r[1] for r in cursor.fetchall()]
+        if column not in cols:
+            cursor.execute(f"ALTER TABLE order_items ADD COLUMN {column} TEXT")
+            self.conn.commit()
 
     def get_orders(self, vendor: Optional[str] = None) -> List[Dict[str, Any]]:
         if vendor:

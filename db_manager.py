@@ -89,6 +89,8 @@ class DatabaseManager:
         self._ensure_unique_index(table_name, "sku")
         # migrate any legacy source_id values to sku for this vendor table
         self._migrate_source_id_to_sku(table_name)
+        # consolidate SKUs from extra_json/raw_excel when possible
+        self._consolidate_skus(table_name)
 
     def upsert_vendor_products(self, vendor: str, products: List[Dict[str, Any]]) -> None:
         self.create_vendor_table(vendor)
@@ -254,6 +256,52 @@ class DatabaseManager:
                     fallback = f"{source_id}_{row_id}"
                     cursor.execute("UPDATE order_items SET sku = ? WHERE id = ?", (fallback, row_id))
             self.conn.commit()
+
+    def _consolidate_skus(self, table_name: str) -> None:
+        """Look into `extra_json` to find vendor-provided SKU values and update rows
+        where `sku` is empty or equals the product_name (fallback). This helps
+        consolidate older rows that used product_name as SKU.
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(f"SELECT id, sku, product_name, extra_json FROM `{table_name}`")
+        rows = cursor.fetchall()
+        for r in rows:
+            row_id = r[0]
+            sku = r[1]
+            product_name = r[2]
+            extra = r[3]
+            needs_update = False
+            if not sku or (product_name and str(sku).strip() == str(product_name).strip()):
+                # try to extract any sku-like field from extra_json
+                try:
+                    data = json.loads(extra or "{}")
+                except Exception:
+                    data = {}
+                candidate = None
+                # check top-level keys in extra/raw_excel for anything with 'sku' in the key
+                for k, v in data.items():
+                    if "sku" in str(k).lower() and v:
+                        candidate = str(v).strip()
+                        break
+                # also check nested raw_excel if present
+                if not candidate and isinstance(data.get("raw_excel"), dict):
+                    for k, v in data.get("raw_excel").items():
+                        if "sku" in str(k).lower() and v:
+                            candidate = str(v).strip()
+                            break
+                if candidate:
+                    # ensure uniqueness
+                    cursor.execute(f"SELECT COUNT(1) FROM `{table_name}` WHERE sku = ?", (candidate,))
+                    if cursor.fetchone()[0] == 0:
+                        cursor.execute(f"UPDATE `{table_name}` SET sku = ? WHERE id = ?", (candidate, row_id))
+                        needs_update = True
+                    else:
+                        # make a unique form
+                        fallback = f"{candidate}_{row_id}"
+                        cursor.execute(f"UPDATE `{table_name}` SET sku = ? WHERE id = ?", (fallback, row_id))
+                        needs_update = True
+            if needs_update:
+                self.conn.commit()
 
     def get_orders(self, vendor: Optional[str] = None) -> List[Dict[str, Any]]:
         if vendor:

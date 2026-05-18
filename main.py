@@ -305,7 +305,8 @@ class VendorManagerApp(QMainWindow):
         for product in self.product_cache:
             index = self.product_table.rowCount()
             self.product_table.insertRow(index)
-            self.product_table.setItem(index, 0, QTableWidgetItem(str(product.get("sku") or "")))
+            display_sku = self._display_sku(product)
+            self.product_table.setItem(index, 0, QTableWidgetItem(display_sku))
             self.product_table.setItem(index, 1, QTableWidgetItem(str(product.get("product_name") or "")))
             self.product_table.setItem(index, 2, QTableWidgetItem(str(product.get("brand") or "")))
             self.product_table.setItem(index, 3, QTableWidgetItem(str(product.get("pack") or "")))
@@ -318,6 +319,47 @@ class VendorManagerApp(QMainWindow):
             self.stats_label.setText(
                 f"{self.current_vendor}: {stats['product_count']} products, inventory value €{stats['inventory_value']:.2f}"
             )
+
+    def _display_sku(self, product: dict) -> str:
+        import json
+        sku = product.get("sku") or ""
+        pname = product.get("product_name") or ""
+        sku_str = str(sku).strip()
+        if not sku_str:
+            extra = product.get("extra_json") or ""
+            try:
+                data = json.loads(extra)
+            except Exception:
+                data = {}
+            candidate = None
+            for k, v in data.items():
+                if "sku" in str(k).lower() and v:
+                    candidate = str(v).strip()
+                    break
+            if not candidate and isinstance(data.get("raw_excel"), dict):
+                for k, v in data.get("raw_excel").items():
+                    if "sku" in str(k).lower() and v:
+                        candidate = str(v).strip()
+                        break
+            return candidate or ""
+        if pname and sku_str.strip() == str(pname).strip():
+            extra = product.get("extra_json") or ""
+            try:
+                data = json.loads(extra)
+            except Exception:
+                data = {}
+            candidate = None
+            for k, v in data.items():
+                if "sku" in str(k).lower() and v:
+                    candidate = str(v).strip()
+                    break
+            if not candidate and isinstance(data.get("raw_excel"), dict):
+                for k, v in data.get("raw_excel").items():
+                    if "sku" in str(k).lower() and v:
+                        candidate = str(v).strip()
+                        break
+            return candidate or sku_str
+        return sku_str
 
     def sync_selected_vendor(self) -> None:
         if not self.current_vendor:

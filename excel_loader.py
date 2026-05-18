@@ -40,6 +40,19 @@ class ExcelLoader:
                     break
             if found:
                 continue
+            # For SKU specifically, prefer any header that contains 'sku' in its normalized form
+            if target == "sku":
+                candidates = [k for k in normalized_cols if "sku" in k]
+                if candidates:
+                    # prefer exact 'sku' or 'vendor_sku' if present
+                    preferred = None
+                    for p in ("sku", "vendor_sku"):
+                        if p in candidates:
+                            preferred = p
+                            break
+                    chosen = preferred or candidates[0]
+                    mapping[target] = lower_cols[chosen]
+                    continue
             # fallback: fuzzy match against headers
             for name in names:
                 normalized = self._normalize_header(name)

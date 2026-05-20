@@ -1,7 +1,7 @@
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QIcon, QPixmap
@@ -9,6 +9,7 @@ from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
     QDialog,
+    QFormLayout,
     QGridLayout,
     QGroupBox,
     QHeaderView,
@@ -52,6 +53,7 @@ class OrderDialog(QDialog):
         self.setMinimumSize(1200, 800)
         self._build_ui()
         self._load_products_table()
+        self.pdf_button.setEnabled(bool(self.order_id))
         if self.cart_items:
             self._update_cart_table()
 
@@ -144,12 +146,13 @@ class OrderDialog(QDialog):
         button_layout.addWidget(self.notes_input)
         
         button_row = QHBoxLayout()
-        self.generate_button = QPushButton("Generate Order (Excel)")
-        self.generate_button.clicked.connect(lambda: self.on_generate_order(format="excel"))
-        button_row.addWidget(self.generate_button)
+        self.save_button = QPushButton("Save Order")
+        self.save_button.clicked.connect(self.on_save_order)
+        button_row.addWidget(self.save_button)
         
         self.pdf_button = QPushButton("Export to PDF")
-        self.pdf_button.clicked.connect(lambda: self.on_generate_order(format="pdf"))
+        self.pdf_button.clicked.connect(self.on_export_to_pdf)
+        self.pdf_button.setEnabled(False)  # disabled until order is saved
         button_row.addWidget(self.pdf_button)
         
         self.cancel_button = QPushButton("Cancel")
@@ -257,6 +260,33 @@ class OrderDialog(QDialog):
         if custom_qty:
             custom_qty.setValue(0)
 
+    def _cart_item_key(self, product: Dict[str, any]) -> tuple:
+        sku = str(product.get("sku") or "").strip()
+        if sku:
+            return ("sku", sku)
+        return (
+            "name",
+            str(product.get("product_name") or "").strip().lower(),
+            str(product.get("pack") or "").strip().lower(),
+            str(product.get("unit") or "").strip().lower(),
+        )
+
+    def _find_duplicate_cart_item(self, product: Dict[str, any]) -> Optional[Dict[str, any]]:
+        key = self._cart_item_key(product)
+        for item in self.cart_items:
+            if self._cart_item_key(item) == key:
+                return item
+        return None
+
+    def _has_duplicate_cart_items(self) -> Optional[str]:
+        seen = set()
+        for item in self.cart_items:
+            key = self._cart_item_key(item)
+            if key in seen:
+                return str(item.get("sku") or item.get("product_name") or "product")
+            seen.add(key)
+        return None
+
     def _create_cart_item(self, product: Dict[str, any], quantity: int) -> Dict[str, any]:
         return {
             "sku": product.get("sku"),
@@ -279,6 +309,13 @@ class OrderDialog(QDialog):
         if quantity <= 0:
             QMessageBox.warning(self, "Invalid quantity", "Please select a quantity > 0")
             return
+        if self._find_duplicate_cart_item(product):
+            QMessageBox.warning(
+                self,
+                "Duplicate item",
+                "This product is already in the cart. Please update the existing line instead of adding it again.",
+            )
+            return
         cart_item = self._create_cart_item(product, quantity)
         self.cart_items.append(cart_item)
         self._update_cart_table()
@@ -297,6 +334,13 @@ class OrderDialog(QDialog):
         quantity = self._get_row_quantity(row)
         if quantity <= 0:
             QMessageBox.warning(self, "Invalid quantity", "Please choose a valid quantity for the selected row.")
+            return
+        if self._find_duplicate_cart_item(product):
+            QMessageBox.warning(
+                self,
+                "Duplicate item",
+                "This product is already in the cart. Please update the existing line instead of adding it again.",
+            )
             return
         cart_item = self._create_cart_item(product, quantity)
         self.cart_items.append(cart_item)
@@ -339,17 +383,29 @@ class OrderDialog(QDialog):
             self.cart_items.pop(row)
             self._update_cart_table()
 
+    def on_save_order(self) -> None:
+        if not self.cart_items:
+            QMessageBox.warning(self, "Empty cart", "Please add items to cart before saving order.")
+            return
+        self._save_order_to_excel_and_db()
+
+    def on_export_to_pdf(self) -> None:
+        if not self.cart_items:
+            QMessageBox.warning(self, "Empty cart", "Please add items to cart before exporting.")
+            return
+        self._export_to_pdf()
+
     def on_generate_order(self, format: str = "excel") -> None:
         if not self.cart_items:
             QMessageBox.warning(self, "Empty cart", "Please add items to cart before generating order.")
             return
         
         if format == "excel":
-            self._export_to_excel()
+            self._save_order_to_excel_and_db()
         elif format == "pdf":
             self._export_to_pdf()
     
-    def _export_to_excel(self) -> None:
+    def _save_order_to_excel_and_db(self) -> None:
         filename = f"{self.vendor}_order_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         order_dir = VENDOR_ROOT / self.vendor / "orders"
         order_dir.mkdir(parents=True, exist_ok=True)
@@ -371,6 +427,16 @@ class OrderDialog(QDialog):
             DataFrame(order_data).to_excel(order_path, index=False)
         except Exception as exc:
             QMessageBox.critical(self, "Order creation failed", f"Could not create order Excel sheet:\n{exc}")
+            return
+
+        # Prevent duplicate cart entries before saving
+        duplicate_item = self._has_duplicate_cart_items()
+        if duplicate_item:
+            QMessageBox.warning(
+                self,
+                "Duplicate items",
+                f"Duplicate product '{duplicate_item}' found in the cart. Please remove or merge duplicates before saving.",
+            )
             return
 
         # Save or update database
@@ -396,7 +462,7 @@ class OrderDialog(QDialog):
                         notes=self.notes_input.toPlainText().strip(),
                     )
             else:
-                self.db.save_order(
+                self.order_id = self.db.save_order(
                     vendor=self.vendor,
                     items=self.cart_items,
                     total_amount=total_amount,
@@ -406,9 +472,40 @@ class OrderDialog(QDialog):
         except Exception as exc:
             QMessageBox.warning(self, "Database save", f"Order Excel saved but DB save failed:\n{exc}")
 
-        QMessageBox.information(self, "Order saved", f"Order sheet created:\n{order_path}")
-        self.accept()
-    
+        QMessageBox.information(self, "Order saved", f"Order saved successfully. You can now export to PDF.")
+        self.pdf_button.setEnabled(True)
+        if hasattr(self.parent(), "_load_order_history"):
+            try:
+                self.parent()._load_order_history()
+            except Exception:
+                pass
+
+    def _export_to_excel(self) -> None:
+        filename = f"{self.vendor}_order_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        order_dir = VENDOR_ROOT / self.vendor / "orders"
+        order_dir.mkdir(parents=True, exist_ok=True)
+        order_path = order_dir / filename
+
+        try:
+            from pandas import DataFrame
+
+            order_data = []
+            for item in self.cart_items:
+                order_data.append({
+                    "Vendor": self.vendor,
+                    "SKU": item.get("sku"),
+                    "Product": item.get("product_name"),
+                    "Brand": item.get("brand"),
+                    "Quantity": item.get("quantity"),
+                })
+
+            DataFrame(order_data).to_excel(order_path, index=False)
+        except Exception as exc:
+            QMessageBox.critical(self, "Excel export failed", f"Could not create Excel file:\n{exc}")
+            return
+
+        QMessageBox.information(self, "Excel exported", f"Order Excel created:\n{order_path}")
+
     def _export_to_pdf(self) -> None:
         try:
             from reportlab.lib.pagesizes import A4
@@ -455,6 +552,26 @@ class OrderDialog(QDialog):
             header_table.setStyle(TableStyle([('VALIGN', (0, 0), (-1, -1), 'MIDDLE')]))
             elements.append(header_table)
             elements.append(Spacer(1, 0.15 * inch))
+
+            profile = self.db.get_vendor_profile(self.vendor)
+            if profile:
+                profile_lines = [f"<b>Vendor profile</b>"]
+                if profile.get("display_name"):
+                    profile_lines.append(f"Name: {profile.get('display_name')}")
+                if profile.get("customer_number"):
+                    profile_lines.append(f"Customer #: {profile.get('customer_number')}")
+                if profile.get("country_of_origin"):
+                    profile_lines.append(f"Country of origin: {profile.get('country_of_origin')}")
+                if profile.get("address"):
+                    profile_lines.append(f"Address: {profile.get('address')}")
+                if profile.get("iban"):
+                    profile_lines.append(f"IBAN: {profile.get('iban')}")
+                if profile.get("bank_name"):
+                    profile_lines.append(f"Bank: {profile.get('bank_name')}")
+                if profile.get("swift_bic"):
+                    profile_lines.append(f"SWIFT/BIC: {profile.get('swift_bic')}")
+                elements.append(Paragraph("<br/>".join(profile_lines), styles['Normal']))
+                elements.append(Spacer(1, 0.2 * inch))
 
             elements.append(Paragraph(f"Order For {self.vendor}", title_style))
             elements.append(Paragraph(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
@@ -504,6 +621,93 @@ class OrderDialog(QDialog):
         self.accept()
 
 
+class VendorProfileDialog(QDialog):
+    def __init__(self, vendor: str, profile: Dict[str, Any], db: DatabaseManager, parent=None):
+        super().__init__(parent)
+        self.vendor = vendor
+        self.profile = profile or {}
+        self.db = db
+        self.setWindowTitle(f"Vendor details - {vendor}")
+        self.setMinimumSize(560, 520)
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.display_name_input = QLineEdit(str(self.profile.get("display_name") or ""))
+        self.legal_name_input = QLineEdit(str(self.profile.get("legal_name") or ""))
+        self.country_of_origin_input = QLineEdit(str(self.profile.get("country_of_origin") or ""))
+        self.address_input = QTextEdit(str(self.profile.get("address") or ""))
+        self.address_input.setMaximumHeight(100)
+        self.contact_name_input = QLineEdit(str(self.profile.get("contact_name") or ""))
+        self.contact_email_input = QLineEdit(str(self.profile.get("contact_email") or ""))
+        self.contact_phone_input = QLineEdit(str(self.profile.get("contact_phone") or ""))
+        self.tax_id_input = QLineEdit(str(self.profile.get("tax_id") or ""))
+        self.vat_id_input = QLineEdit(str(self.profile.get("vat_id") or ""))
+        self.iban_input = QLineEdit(str(self.profile.get("iban") or ""))
+        self.bank_name_input = QLineEdit(str(self.profile.get("bank_name") or ""))
+        self.swift_bic_input = QLineEdit(str(self.profile.get("swift_bic") or ""))
+        self.customer_number_input = QLineEdit(str(self.profile.get("customer_number") or ""))
+
+        self.display_name_input.setPlaceholderText("Optional display name for reports")
+        self.country_of_origin_input.setPlaceholderText("Country of origin / supplier country")
+        self.iban_input.setPlaceholderText("International Bank Account Number")
+        self.swift_bic_input.setPlaceholderText("SWIFT / BIC code")
+        self.customer_number_input.setPlaceholderText("Customer number for this vendor")
+
+        form.addRow("Vendor folder", QLabel(self.vendor))
+        form.addRow("Display name", self.display_name_input)
+        form.addRow("Legal name", self.legal_name_input)
+        form.addRow("Country of origin", self.country_of_origin_input)
+        form.addRow("Customer number", self.customer_number_input)
+        form.addRow("Address", self.address_input)
+        form.addRow("Contact name", self.contact_name_input)
+        form.addRow("Contact email", self.contact_email_input)
+        form.addRow("Contact phone", self.contact_phone_input)
+        form.addRow("Tax ID", self.tax_id_input)
+        form.addRow("VAT ID", self.vat_id_input)
+        form.addRow("IBAN", self.iban_input)
+        form.addRow("Bank name", self.bank_name_input)
+        form.addRow("SWIFT/BIC", self.swift_bic_input)
+
+        layout.addLayout(form)
+
+        button_row = QHBoxLayout()
+        save_btn = QPushButton("Save details")
+        save_btn.clicked.connect(self.on_save)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        button_row.addStretch()
+        button_row.addWidget(save_btn)
+        button_row.addWidget(cancel_btn)
+        layout.addLayout(button_row)
+
+    def on_save(self) -> None:
+        profile = {
+            "display_name": self.display_name_input.text().strip(),
+            "legal_name": self.legal_name_input.text().strip(),
+            "country_of_origin": self.country_of_origin_input.text().strip(),
+            "address": self.address_input.toPlainText().strip(),
+            "contact_name": self.contact_name_input.text().strip(),
+            "contact_email": self.contact_email_input.text().strip(),
+            "contact_phone": self.contact_phone_input.text().strip(),
+            "tax_id": self.tax_id_input.text().strip(),
+            "vat_id": self.vat_id_input.text().strip(),
+            "iban": self.iban_input.text().strip(),
+            "bank_name": self.bank_name_input.text().strip(),
+            "swift_bic": self.swift_bic_input.text().strip(),
+            "customer_number": self.customer_number_input.text().strip(),
+        }
+        try:
+            self.db.save_vendor_profile(self.vendor, profile)
+        except Exception as exc:
+            QMessageBox.critical(self, "Save failed", f"Could not save vendor details:\n{exc}")
+            return
+        QMessageBox.information(self, "Saved", "Vendor details saved successfully.")
+        self.accept()
+
+
 class VendorManagerApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -534,9 +738,12 @@ class VendorManagerApp(QMainWindow):
         self.sync_all_button.clicked.connect(self.sync_all_vendors)
         self.order_button = QPushButton("Create order")
         self.order_button.clicked.connect(self.open_order_dialog)
+        self.vendor_details_button = QPushButton("Vendor details")
+        self.vendor_details_button.clicked.connect(self.open_vendor_details)
         left_panel.addWidget(self.sync_vendor_button)
         left_panel.addWidget(self.sync_all_button)
         left_panel.addWidget(self.order_button)
+        left_panel.addWidget(self.vendor_details_button)
 
         right_panel = QVBoxLayout()
         header = QHBoxLayout()
@@ -563,6 +770,15 @@ class VendorManagerApp(QMainWindow):
         stats_layout.addWidget(self.stats_table)
         stats_box.setLayout(stats_layout)
         right_panel.addWidget(stats_box)
+
+        details_box = QGroupBox("Vendor business details")
+        details_layout = QVBoxLayout()
+        self.vendor_detail_summary = QLabel("No vendor selected.")
+        self.vendor_detail_summary.setWordWrap(True)
+        self.vendor_detail_summary.setTextFormat(Qt.RichText)
+        details_layout.addWidget(self.vendor_detail_summary)
+        details_box.setLayout(details_layout)
+        right_panel.addWidget(details_box)
 
         self.product_table = QTableWidget(0, 10)
         self.product_table.setHorizontalHeaderLabels(
@@ -602,8 +818,8 @@ class VendorManagerApp(QMainWindow):
         orders_btn_row.addWidget(self.create_demo_btn)
         orders_layout.addLayout(orders_btn_row)
 
-        self.orders_table = QTableWidget(0, 4)
-        self.orders_table.setHorizontalHeaderLabels(["Vendor", "Date", "Total", "Filename"])
+        self.orders_table = QTableWidget(0, 6)
+        self.orders_table.setHorizontalHeaderLabels(["Vendor", "Created", "Updated", "Status", "Total", "Filename"])
         self.orders_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.orders_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.orders_table.setSelectionMode(QTableWidget.SingleSelection)
@@ -651,8 +867,12 @@ class VendorManagerApp(QMainWindow):
             vendor_item.setData(Qt.UserRole, order.get("id"))
             self.orders_table.setItem(index, 0, vendor_item)
             self.orders_table.setItem(index, 1, QTableWidgetItem(order["created_at"]))
-            self.orders_table.setItem(index, 2, QTableWidgetItem(f"{order['total_amount']:.2f}"))
-            self.orders_table.setItem(index, 3, QTableWidgetItem(order["order_filename"] or ""))
+            updated_at = order.get("updated_at") or ""
+            status = "Edited" if updated_at else "Created"
+            self.orders_table.setItem(index, 2, QTableWidgetItem(updated_at))
+            self.orders_table.setItem(index, 3, QTableWidgetItem(status))
+            self.orders_table.setItem(index, 4, QTableWidgetItem(f"{order['total_amount']:.2f}"))
+            self.orders_table.setItem(index, 5, QTableWidgetItem(order["order_filename"] or ""))
         # clear selection and disable action buttons until user picks a row
         self.orders_table.clearSelection()
         self.on_order_selection_changed()
@@ -694,6 +914,52 @@ class VendorManagerApp(QMainWindow):
             self.stats_label.setText(
                 f"{self.current_vendor}: {stats['product_count']} products, inventory value €{stats['inventory_value']:.2f}"
             )
+            self._load_vendor_profile_summary(self.current_vendor)
+
+    def _load_vendor_profile_summary(self, vendor: str) -> None:
+        profile = self.db.get_vendor_profile(vendor)
+        if not profile:
+            self.vendor_detail_summary.setText(
+                "No vendor details saved. Click <b>Vendor details</b> to add business info like country of origin, IBAN, tax IDs and contact details."
+            )
+            return
+
+        display_name = profile.get("display_name") or vendor
+        lines = [f"<b>{display_name}</b>"]
+        if profile.get("legal_name"):
+            lines.append(f"Legal name: {profile.get('legal_name')}")
+        if profile.get("customer_number"):
+            lines.append(f"Customer #: {profile.get('customer_number')}")
+        if profile.get("country_of_origin"):
+            lines.append(f"Country of origin: {profile.get('country_of_origin')}")
+        if profile.get("address"):
+            lines.append(f"Address: {profile.get('address').replace(chr(10), '<br/>')}")
+        if profile.get("contact_name"):
+            lines.append(f"Contact: {profile.get('contact_name')}")
+        if profile.get("contact_email"):
+            lines.append(f"Email: {profile.get('contact_email')}")
+        if profile.get("contact_phone"):
+            lines.append(f"Phone: {profile.get('contact_phone')}")
+        if profile.get("tax_id"):
+            lines.append(f"Tax ID: {profile.get('tax_id')}")
+        if profile.get("vat_id"):
+            lines.append(f"VAT ID: {profile.get('vat_id')}")
+        if profile.get("iban"):
+            lines.append(f"IBAN: {profile.get('iban')}")
+        if profile.get("bank_name"):
+            lines.append(f"Bank: {profile.get('bank_name')}")
+        if profile.get("swift_bic"):
+            lines.append(f"SWIFT/BIC: {profile.get('swift_bic')}")
+        self.vendor_detail_summary.setText("<br/>".join(lines))
+
+    def open_vendor_details(self) -> None:
+        if not self.current_vendor:
+            QMessageBox.warning(self, "No vendor selected", "Please select a vendor before opening vendor details.")
+            return
+        profile = self.db.get_vendor_profile(self.current_vendor)
+        dialog = VendorProfileDialog(self.current_vendor, profile, self.db, parent=self)
+        if dialog.exec_():
+            self._load_vendor_profile_summary(self.current_vendor)
 
     def _display_sku(self, product: dict) -> str:
         import json

@@ -13,6 +13,7 @@ class DatabaseManager:
         self.conn = sqlite3.connect(str(self.db_path))
         self.conn.row_factory = sqlite3.Row
         self._ensure_order_tables()
+        self._ensure_vendor_profiles_table()
 
     def _execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         cursor = self.conn.cursor()
@@ -34,12 +35,14 @@ class DatabaseManager:
                 id INTEGER PRIMARY KEY,
                 vendor TEXT NOT NULL,
                 created_at TEXT NOT NULL,
+                updated_at TEXT,
                 total_amount REAL NOT NULL,
                 order_filename TEXT,
                 notes TEXT
             )
             """
         )
+        self._ensure_column_on_orders("updated_at")
         self._execute(
             """
             CREATE TABLE IF NOT EXISTS order_items (
@@ -63,6 +66,32 @@ class DatabaseManager:
         self._ensure_column_on_order_items("sku")
         # migrate any legacy source_id values to sku on order_items
         self._migrate_order_items_source_id()
+
+    def _ensure_vendor_profiles_table(self) -> None:
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS vendor_profiles (
+                vendor TEXT PRIMARY KEY,
+                display_name TEXT,
+                legal_name TEXT,
+                address TEXT,
+                country_of_origin TEXT,
+                contact_name TEXT,
+                contact_email TEXT,
+                contact_phone TEXT,
+                tax_id TEXT,
+                vat_id TEXT,
+                iban TEXT,
+                bank_name TEXT,
+                swift_bic TEXT,
+                customer_number TEXT,
+                extra_json TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        self.conn.commit()
+        self._ensure_column_on_vendor_profiles("customer_number")
 
     def create_vendor_table(self, vendor: str) -> None:
         table_name = self.vendor_table_name(vendor)
@@ -225,6 +254,22 @@ class DatabaseManager:
             cursor.execute(f"ALTER TABLE order_items ADD COLUMN {column} TEXT")
             self.conn.commit()
 
+    def _ensure_column_on_orders(self, column: str) -> None:
+        cursor = self.conn.cursor()
+        cursor.execute("PRAGMA table_info(orders)")
+        cols = [r[1] for r in cursor.fetchall()]
+        if column not in cols:
+            cursor.execute(f"ALTER TABLE orders ADD COLUMN {column} TEXT")
+            self.conn.commit()
+
+    def _ensure_column_on_vendor_profiles(self, column: str) -> None:
+        cursor = self.conn.cursor()
+        cursor.execute("PRAGMA table_info(vendor_profiles)")
+        cols = [r[1] for r in cursor.fetchall()]
+        if column not in cols:
+            cursor.execute(f"ALTER TABLE vendor_profiles ADD COLUMN {column} TEXT")
+            self.conn.commit()
+
     def _migrate_source_id_to_sku(self, table_name: str) -> None:
         # If the legacy `source_id` column exists, copy its values into `sku` where missing.
         cursor = self.conn.cursor()
@@ -315,6 +360,70 @@ class DatabaseManager:
             if needs_update:
                 self.conn.commit()
 
+    def get_vendor_profile(self, vendor: str) -> Dict[str, Any]:
+        cursor = self._execute("SELECT * FROM vendor_profiles WHERE vendor = ?", (vendor,))
+        row = cursor.fetchone()
+        return dict(row) if row else {}
+
+    def save_vendor_profile(self, vendor: str, profile: Dict[str, Any]) -> None:
+        now = datetime.utcnow().isoformat()
+        display_name = str(profile.get("display_name") or "").strip()
+        legal_name = str(profile.get("legal_name") or "").strip()
+        address = str(profile.get("address") or "").strip()
+        country_of_origin = str(profile.get("country_of_origin") or "").strip()
+        contact_name = str(profile.get("contact_name") or "").strip()
+        contact_email = str(profile.get("contact_email") or "").strip()
+        contact_phone = str(profile.get("contact_phone") or "").strip()
+        tax_id = str(profile.get("tax_id") or "").strip()
+        vat_id = str(profile.get("vat_id") or "").strip()
+        iban = str(profile.get("iban") or "").strip()
+        bank_name = str(profile.get("bank_name") or "").strip()
+        swift_bic = str(profile.get("swift_bic") or "").strip()
+        customer_number = str(profile.get("customer_number") or "").strip()
+        extra_json = json.dumps(profile, default=str)
+        self._execute(
+            """
+            INSERT INTO vendor_profiles
+                (vendor, display_name, legal_name, address, country_of_origin, contact_name, contact_email, contact_phone, tax_id, vat_id, iban, bank_name, swift_bic, customer_number, extra_json, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(vendor) DO UPDATE SET
+                display_name = excluded.display_name,
+                legal_name = excluded.legal_name,
+                address = excluded.address,
+                country_of_origin = excluded.country_of_origin,
+                contact_name = excluded.contact_name,
+                contact_email = excluded.contact_email,
+                contact_phone = excluded.contact_phone,
+                tax_id = excluded.tax_id,
+                vat_id = excluded.vat_id,
+                iban = excluded.iban,
+                bank_name = excluded.bank_name,
+                swift_bic = excluded.swift_bic,
+                customer_number = excluded.customer_number,
+                extra_json = excluded.extra_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                vendor,
+                display_name,
+                legal_name,
+                address,
+                country_of_origin,
+                contact_name,
+                contact_email,
+                contact_phone,
+                tax_id,
+                vat_id,
+                iban,
+                bank_name,
+                swift_bic,
+                customer_number,
+                extra_json,
+                now,
+            ),
+        )
+        self.conn.commit()
+
     def get_orders(self, vendor: Optional[str] = None) -> List[Dict[str, Any]]:
         if vendor:
             cursor = self._execute("SELECT * FROM orders WHERE vendor = ? ORDER BY created_at DESC", (vendor,))
@@ -335,17 +444,18 @@ class DatabaseManager:
         order_filename: Optional[str] = None,
     ) -> None:
         """Update an existing order and replace its items with the provided list."""
+        now = datetime.utcnow().isoformat()
         cursor = self.conn.cursor()
-        # Update orders metadata
+        # Update orders metadata with updated_at timestamp
         if order_filename is not None:
             cursor.execute(
-                "UPDATE orders SET total_amount = ?, order_filename = ?, notes = ? WHERE id = ?",
-                (total_amount, order_filename, notes or "", order_id),
+                "UPDATE orders SET total_amount = ?, order_filename = ?, notes = ?, updated_at = ? WHERE id = ?",
+                (total_amount, order_filename, notes or "", now, order_id),
             )
         else:
             cursor.execute(
-                "UPDATE orders SET total_amount = ?, notes = ? WHERE id = ?",
-                (total_amount, notes or "", order_id),
+                "UPDATE orders SET total_amount = ?, notes = ?, updated_at = ? WHERE id = ?",
+                (total_amount, notes or "", now, order_id),
             )
 
         # Remove existing items and insert new ones

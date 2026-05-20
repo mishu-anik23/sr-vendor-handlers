@@ -85,6 +85,7 @@ class DatabaseManager:
                 bank_name TEXT,
                 swift_bic TEXT,
                 customer_number TEXT,
+                customer_website TEXT,
                 extra_json TEXT,
                 updated_at TEXT
             )
@@ -92,6 +93,7 @@ class DatabaseManager:
         )
         self.conn.commit()
         self._ensure_column_on_vendor_profiles("customer_number")
+        self._ensure_column_on_vendor_profiles("customer_website")
 
     def create_vendor_table(self, vendor: str) -> None:
         table_name = self.vendor_table_name(vendor)
@@ -380,12 +382,13 @@ class DatabaseManager:
         bank_name = str(profile.get("bank_name") or "").strip()
         swift_bic = str(profile.get("swift_bic") or "").strip()
         customer_number = str(profile.get("customer_number") or "").strip()
+        customer_website = str(profile.get("customer_website") or "").strip()
         extra_json = json.dumps(profile, default=str)
         self._execute(
             """
             INSERT INTO vendor_profiles
-                (vendor, display_name, legal_name, address, country_of_origin, contact_name, contact_email, contact_phone, tax_id, vat_id, iban, bank_name, swift_bic, customer_number, extra_json, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (vendor, display_name, legal_name, address, country_of_origin, contact_name, contact_email, contact_phone, tax_id, vat_id, iban, bank_name, swift_bic, customer_number, customer_website, extra_json, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(vendor) DO UPDATE SET
                 display_name = excluded.display_name,
                 legal_name = excluded.legal_name,
@@ -400,6 +403,7 @@ class DatabaseManager:
                 bank_name = excluded.bank_name,
                 swift_bic = excluded.swift_bic,
                 customer_number = excluded.customer_number,
+                customer_website = excluded.customer_website,
                 extra_json = excluded.extra_json,
                 updated_at = excluded.updated_at
             """,
@@ -418,6 +422,7 @@ class DatabaseManager:
                 bank_name,
                 swift_bic,
                 customer_number,
+                customer_website,
                 extra_json,
                 now,
             ),

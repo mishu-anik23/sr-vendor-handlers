@@ -560,6 +560,10 @@ class OrderDialog(QDialog):
                     profile_lines.append(f"Name: {profile.get('display_name')}")
                 if profile.get("customer_number"):
                     profile_lines.append(f"Customer #: {profile.get('customer_number')}")
+                
+                
+                if profile.get("customer_website"):
+                    profile_lines.append(f"Website: {profile.get('customer_website')}")
                 if profile.get("country_of_origin"):
                     profile_lines.append(f"Country of origin: {profile.get('country_of_origin')}")
                 if profile.get("address"):
@@ -649,18 +653,21 @@ class VendorProfileDialog(QDialog):
         self.bank_name_input = QLineEdit(str(self.profile.get("bank_name") or ""))
         self.swift_bic_input = QLineEdit(str(self.profile.get("swift_bic") or ""))
         self.customer_number_input = QLineEdit(str(self.profile.get("customer_number") or ""))
+        self.customer_website_input = QLineEdit(str(self.profile.get("customer_website") or ""))
 
         self.display_name_input.setPlaceholderText("Optional display name for reports")
         self.country_of_origin_input.setPlaceholderText("Country of origin / supplier country")
         self.iban_input.setPlaceholderText("International Bank Account Number")
         self.swift_bic_input.setPlaceholderText("SWIFT / BIC code")
         self.customer_number_input.setPlaceholderText("Customer number for this vendor")
+        self.customer_website_input.setPlaceholderText("Vendor website (https://...)")
 
         form.addRow("Vendor folder", QLabel(self.vendor))
         form.addRow("Display name", self.display_name_input)
         form.addRow("Legal name", self.legal_name_input)
         form.addRow("Country of origin", self.country_of_origin_input)
         form.addRow("Customer number", self.customer_number_input)
+        form.addRow("Website", self.customer_website_input)
         form.addRow("Address", self.address_input)
         form.addRow("Contact name", self.contact_name_input)
         form.addRow("Contact email", self.contact_email_input)
@@ -698,6 +705,7 @@ class VendorProfileDialog(QDialog):
             "bank_name": self.bank_name_input.text().strip(),
             "swift_bic": self.swift_bic_input.text().strip(),
             "customer_number": self.customer_number_input.text().strip(),
+                "customer_website": self.customer_website_input.text().strip(),
         }
         try:
             self.db.save_vendor_profile(self.vendor, profile)
@@ -930,6 +938,9 @@ class VendorManagerApp(QMainWindow):
             lines.append(f"Legal name: {profile.get('legal_name')}")
         if profile.get("customer_number"):
             lines.append(f"Customer #: {profile.get('customer_number')}")
+        if profile.get("customer_website"):
+            site = profile.get("customer_website")
+            lines.append(f"Website: <a href=\"{site}\">{site}</a>")
         if profile.get("country_of_origin"):
             lines.append(f"Country of origin: {profile.get('country_of_origin')}")
         if profile.get("address"):

@@ -744,12 +744,15 @@ class VendorManagerApp(QMainWindow):
         self.sync_vendor_button.clicked.connect(self.sync_selected_vendor)
         self.sync_all_button = QPushButton("Sync all vendors")
         self.sync_all_button.clicked.connect(self.sync_all_vendors)
+        self.reset_vendor_button = QPushButton("Reset selected vendor products")
+        self.reset_vendor_button.clicked.connect(self.reset_selected_vendor_products)
         self.order_button = QPushButton("Create order")
         self.order_button.clicked.connect(self.open_order_dialog)
         self.vendor_details_button = QPushButton("Vendor details")
         self.vendor_details_button.clicked.connect(self.open_vendor_details)
         left_panel.addWidget(self.sync_vendor_button)
         left_panel.addWidget(self.sync_all_button)
+        left_panel.addWidget(self.reset_vendor_button)
         left_panel.addWidget(self.order_button)
         left_panel.addWidget(self.vendor_details_button)
 
@@ -1018,6 +1021,27 @@ class VendorManagerApp(QMainWindow):
             QMessageBox.warning(self, "No vendor selected", "Please select a vendor before syncing.")
             return
         self._sync_vendor(self.current_vendor)
+
+    def reset_selected_vendor_products(self) -> None:
+        if not self.current_vendor:
+            QMessageBox.warning(self, "No vendor selected", "Please select a vendor before resetting products.")
+            return
+        response = QMessageBox.question(
+            self,
+            "Reset vendor products",
+            f"This will remove all stored product rows for vendor '{self.current_vendor}' from the database.\nDo you want to continue?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if response != QMessageBox.Yes:
+            return
+
+        try:
+            self.db.reset_vendor_products(self.current_vendor)
+            self._load_products_for_vendor(self.current_vendor)
+            self._refresh_all_stats()
+            QMessageBox.information(self, "Reset complete", f"Product data for '{self.current_vendor}' has been cleared.")
+        except Exception as exc:
+            QMessageBox.warning(self, "Reset failed", f"Could not reset vendor product data:\n{exc}")
 
     def sync_all_vendors(self) -> None:
         for vendor in self.vendor_names:

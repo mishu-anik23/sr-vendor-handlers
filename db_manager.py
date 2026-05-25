@@ -14,6 +14,26 @@ class DatabaseManager:
         self.conn.row_factory = sqlite3.Row
         self._ensure_order_tables()
         self._ensure_vendor_profiles_table()
+        self._fix_sr_sku_unique_indexes()  # Fix the incorrect UNIQUE constraint on sr_sku
+
+    def _fix_sr_sku_unique_indexes(self) -> None:
+        """Drop UNIQUE indexes on sr_sku for all vendor tables since sr_sku can be NULL
+        and NULL values cause issues with UNIQUE constraints in SQLite."""
+        cursor = self.conn.cursor()
+        # Get all vendor tables
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'vendor_%'")
+        tables = [row[0] for row in cursor.fetchall()]
+        
+        for table_name in tables:
+            # Check if the incorrect UNIQUE index exists
+            index_name = f"idx_{table_name}_sr_sku"
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='index' AND name = ?", (index_name,))
+            if cursor.fetchone():
+                try:
+                    cursor.execute(f"DROP INDEX `{index_name}`")
+                    self.conn.commit()
+                except sqlite3.OperationalError:
+                    pass  # Index might not exist or already dropped
 
     def _execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         cursor = self.conn.cursor()
@@ -123,7 +143,8 @@ class DatabaseManager:
         # ensure barcode and sr_sku columns/index
         self._ensure_column_on_table(table_name, "barcode")
         self._ensure_column_on_table(table_name, "sr_sku")
-        self._ensure_unique_index(table_name, "sr_sku")
+        # Note: sr_sku is NOT uniquely indexed because many products may not have a vendor-provided SKU (NULL values)
+        # and SQLite's UNIQUE constraint treats multiple NULLs as duplicates in some configurations
         # migrate any legacy source_id values to sku for this vendor table
         self._migrate_source_id_to_sku(table_name)
         # consolidate SKUs from extra_json/raw_excel when possible
@@ -197,6 +218,12 @@ class DatabaseManager:
             "barcode_count": int(row["barcode_count"] or 0),
             "srsku_count": int(row["srsku_count"] or 0),
         }
+
+    def reset_vendor_products(self, vendor: str) -> None:
+        table_name = self.vendor_table_name(vendor)
+        self.create_vendor_table(vendor)
+        self._execute(f"DELETE FROM `{table_name}`")
+        self.conn.commit()
 
     def get_all_vendor_statistics(self, vendors: List[str]) -> List[Dict[str, Any]]:
         return [self.get_vendor_statistics(v) for v in vendors]

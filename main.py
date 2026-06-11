@@ -715,6 +715,298 @@ class VendorProfileDialog(QDialog):
         QMessageBox.information(self, "Saved", "Vendor details saved successfully.")
         self.accept()
 
+class EditProductDialog(QDialog):
+    def __init__(self, product: Dict[str, Any], parent=None):
+        super().__init__(parent)
+        self.product = product
+        self.setWindowTitle(f"Edit Product: {product.get('sku')}")
+        self.setMinimumSize(400, 350)
+        self.updated_data = {}
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.sku_input = QLineEdit(str(self.product.get("sku") or ""))
+        self.sku_input.setReadOnly(True)
+        self.product_name_input = QLineEdit(str(self.product.get("product_name") or ""))
+        self.brand_input = QLineEdit(str(self.product.get("brand") or ""))
+        self.pack_input = QLineEdit(str(self.product.get("pack") or ""))
+        self.unit_input = QLineEdit(str(self.product.get("unit") or ""))
+        
+        self.ctn_qty_input = QSpinBox()
+        self.ctn_qty_input.setMinimum(0)
+        self.ctn_qty_input.setMaximum(100000)
+        self.ctn_qty_input.setValue(int(self.product.get("ctn_qty") or 0))
+
+        self.price_input = QLineEdit(str(self.product.get("price") or 0.0))
+        self.stock_input = QLineEdit(str(self.product.get("stock") or ""))
+        
+        self.barcode_input = QLineEdit(str(self.product.get("barcode") or ""))
+        self.sr_sku_input = QLineEdit(str(self.product.get("sr_sku") or ""))
+
+        form.addRow("SKU", self.sku_input)
+        form.addRow("Product Name", self.product_name_input)
+        form.addRow("Brand", self.brand_input)
+        form.addRow("Pack", self.pack_input)
+        form.addRow("Unit", self.unit_input)
+        form.addRow("CTN Qty", self.ctn_qty_input)
+        form.addRow("Price", self.price_input)
+        form.addRow("Stock (Status/Qty)", self.stock_input)
+        form.addRow("Barcode", self.barcode_input)
+        form.addRow("SR-SKU", self.sr_sku_input)
+
+        layout.addLayout(form)
+
+        button_row = QHBoxLayout()
+        save_btn = QPushButton("Save")
+        save_btn.clicked.connect(self.on_save)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        button_row.addStretch()
+        button_row.addWidget(save_btn)
+        button_row.addWidget(cancel_btn)
+        layout.addLayout(button_row)
+
+    def on_save(self) -> None:
+        try:
+            price_val = float(self.price_input.text())
+        except ValueError:
+            QMessageBox.warning(self, "Invalid Input", "Price must be a valid number.")
+            return
+
+        self.updated_data = {
+            "product_name": self.product_name_input.text().strip(),
+            "brand": self.brand_input.text().strip(),
+            "pack": self.pack_input.text().strip(),
+            "unit": self.unit_input.text().strip(),
+            "ctn_qty": self.ctn_qty_input.value(),
+            "price": price_val,
+            "stock": self.stock_input.text().strip(),
+            "barcode": self.barcode_input.text().strip(),
+            "sr_sku": self.sr_sku_input.text().strip(),
+            "last_updated": datetime.now().isoformat()
+        }
+        self.accept()
+
+
+class InventoryDialog(QDialog):
+    def __init__(self, current_vendor: str, all_vendors: List[str], db: DatabaseManager, parent=None):
+        super().__init__(parent)
+        self.current_vendor = current_vendor
+        self.all_vendors = all_vendors
+        self.db = db
+        self.products: List[Dict[str, Any]] = []
+        self.setWindowTitle("Product Inventory Management")
+        self.setMinimumSize(1200, 800)
+        self._build_ui()
+        self._load_products()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        # Header controls
+        header_layout = QHBoxLayout()
+        
+        header_layout.addWidget(QLabel("Vendor:"))
+        self.vendor_combo = QComboBox()
+        self.vendor_combo.addItems(self.all_vendors)
+        self.vendor_combo.setCurrentText(self.current_vendor)
+        self.vendor_combo.currentTextChanged.connect(self.on_vendor_changed)
+        header_layout.addWidget(self.vendor_combo)
+
+        header_layout.addWidget(QLabel("Search:"))
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search by name or SKU...")
+        self.search_input.textChanged.connect(self._filter_products)
+        header_layout.addWidget(self.search_input)
+
+        header_layout.addWidget(QLabel("Brand:"))
+        self.brand_filter = QComboBox()
+        self.brand_filter.addItem("All brands")
+        self.brand_filter.currentTextChanged.connect(self._filter_products)
+        header_layout.addWidget(self.brand_filter)
+
+        header_layout.addStretch()
+
+        self.export_vendor_btn = QPushButton("Export Current Vendor")
+        self.export_vendor_btn.clicked.connect(self.on_export_vendor)
+        header_layout.addWidget(self.export_vendor_btn)
+
+        self.export_all_btn = QPushButton("Export All Vendors")
+        self.export_all_btn.clicked.connect(self.on_export_all)
+        header_layout.addWidget(self.export_all_btn)
+
+        layout.addLayout(header_layout)
+
+        # Table
+        self.table = QTableWidget(0, 10)
+        self.table.setHorizontalHeaderLabels(
+            ["SKU", "Product", "Brand", "Pack", "Unit", "CTN Qty", "Price", "Stock", "Barcode", "SR-SKU"]
+        )
+        self.table.setSortingEnabled(True)
+        header = self.table.horizontalHeader()
+        for col in range(self.table.columnCount()):
+            header.setSectionResizeMode(col, QHeaderView.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.setColumnWidth(1, 400)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.itemDoubleClicked.connect(self.on_edit_selected)
+        layout.addWidget(self.table)
+
+        # Bottom controls
+        bottom_layout = QHBoxLayout()
+        self.edit_btn = QPushButton("Edit Selected Product")
+        self.edit_btn.clicked.connect(self.on_edit_selected)
+        bottom_layout.addWidget(self.edit_btn)
+        bottom_layout.addStretch()
+        self.close_btn = QPushButton("Close")
+        self.close_btn.clicked.connect(self.accept)
+        bottom_layout.addWidget(self.close_btn)
+
+        layout.addLayout(bottom_layout)
+
+    def on_vendor_changed(self, vendor_name: str) -> None:
+        self.current_vendor = vendor_name
+        self._load_products()
+
+    def _load_products(self) -> None:
+        self.table.setSortingEnabled(False)
+        self.products = self.db.get_vendor_products(self.current_vendor)
+        
+        self.brand_filter.blockSignals(True)
+        self.brand_filter.clear()
+        self.brand_filter.addItem("All brands")
+        brands = sorted({str(p.get("brand")).strip() for p in self.products if p.get("brand")})
+        for b in brands:
+            if b:
+                self.brand_filter.addItem(b)
+        self.brand_filter.blockSignals(False)
+        
+        self.table.setRowCount(len(self.products))
+        
+        for row, product in enumerate(self.products):
+            sku_item = QTableWidgetItem(str(product.get("sku") or ""))
+            sku_item.setData(Qt.UserRole, product)
+            
+            self.table.setItem(row, 0, sku_item)
+            self.table.setItem(row, 1, QTableWidgetItem(str(product.get("product_name") or "")))
+            self.table.setItem(row, 2, QTableWidgetItem(str(product.get("brand") or "")))
+            self.table.setItem(row, 3, QTableWidgetItem(str(product.get("pack") or "")))
+            self.table.setItem(row, 4, QTableWidgetItem(str(product.get("unit") or "")))
+            
+            ctn_qty_item = QTableWidgetItem()
+            ctn_qty_item.setData(Qt.DisplayRole, int(product.get("ctn_qty") or 0))
+            self.table.setItem(row, 5, ctn_qty_item)
+            
+            price_item = QTableWidgetItem()
+            price_item.setData(Qt.DisplayRole, float(product.get("price") or 0.0))
+            self.table.setItem(row, 6, price_item)
+            
+            self.table.setItem(row, 7, QTableWidgetItem(str(product.get("stock") or "")))
+            self.table.setItem(row, 8, QTableWidgetItem(str(product.get("barcode") or "")))
+            self.table.setItem(row, 9, QTableWidgetItem(str(product.get("sr_sku") or "")))
+            
+        self.table.setSortingEnabled(True)
+        self._filter_products()
+
+    def _filter_products(self) -> None:
+        search_text = self.search_input.text().lower()
+        selected_brand = self.brand_filter.currentText()
+        
+        for row in range(self.table.rowCount()):
+            sku_item = self.table.item(row, 0)
+            if not sku_item:
+                continue
+            
+            product = sku_item.data(Qt.UserRole)
+            if not product:
+                continue
+            
+            prod_name = str(product.get("product_name") or "").lower()
+            sku = str(product.get("sku") or "").lower()
+            matches_search = search_text == "" or search_text in prod_name or search_text in sku
+            
+            brand = str(product.get("brand") or "").strip()
+            matches_brand = selected_brand == "All brands" or brand == selected_brand
+            
+            self.table.setRowHidden(row, not (matches_search and matches_brand))
+
+    def on_edit_selected(self) -> None:
+        sel_items = self.table.selectedItems()
+        if not sel_items:
+            QMessageBox.warning(self, "No selection", "Please select a product to edit.")
+            return
+        
+        row = sel_items[0].row()
+        sku_item = self.table.item(row, 0)
+        product = sku_item.data(Qt.UserRole)
+        
+        dialog = EditProductDialog(product, self)
+        if dialog.exec_():
+            updated_data = dialog.updated_data
+            sku = product.get("sku")
+            if sku:
+                try:
+                    self.db.update_vendor_product(self.current_vendor, sku, updated_data)
+                    self._load_products()
+                except Exception as exc:
+                    QMessageBox.critical(self, "Error", f"Failed to update product:\n{exc}")
+
+    def on_export_vendor(self) -> None:
+        if not self.products:
+            QMessageBox.warning(self, "No data", "No products to export.")
+            return
+        self._export_to_excel(self.products, f"{self.current_vendor}_inventory_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+
+    def on_export_all(self) -> None:
+        all_products = []
+        for vendor in self.all_vendors:
+            prods = self.db.get_vendor_products(vendor)
+            for p in prods:
+                p["_vendor"] = vendor
+            all_products.extend(prods)
+        
+        if not all_products:
+            QMessageBox.warning(self, "No data", "No products to export.")
+            return
+        self._export_to_excel(all_products, f"all_vendors_inventory_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+
+    def _export_to_excel(self, data_list: List[Dict[str, Any]], filename: str) -> None:
+        try:
+            from pandas import DataFrame
+            
+            export_data = []
+            for item in data_list:
+                row_dict = {
+                    "Vendor": item.get("_vendor", self.current_vendor),
+                    "SKU": item.get("sku"),
+                    "Product": item.get("product_name"),
+                    "Brand": item.get("brand"),
+                    "Pack": item.get("pack"),
+                    "Unit": item.get("unit"),
+                    "CTN Qty": item.get("ctn_qty"),
+                    "Price": item.get("price"),
+                    "Stock": item.get("stock"),
+                    "Barcode": item.get("barcode"),
+                    "SR-SKU": item.get("sr_sku"),
+                }
+                export_data.append(row_dict)
+                
+            if "all_vendors" in filename:
+                export_dir = VENDOR_ROOT / "exports"
+            else:
+                export_dir = VENDOR_ROOT / self.current_vendor / "exports"
+            export_dir.mkdir(parents=True, exist_ok=True)
+            export_path = export_dir / filename
+            
+            DataFrame(export_data).to_excel(export_path, index=False)
+            QMessageBox.information(self, "Export Successful", f"Inventory exported to:\n{export_path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Failed", f"Could not create Excel file:\n{exc}")
 
 class VendorManagerApp(QMainWindow):
     def __init__(self):
@@ -746,6 +1038,8 @@ class VendorManagerApp(QMainWindow):
         self.sync_all_button.clicked.connect(self.sync_all_vendors)
         self.reset_vendor_button = QPushButton("Reset selected vendor products")
         self.reset_vendor_button.clicked.connect(self.reset_selected_vendor_products)
+        self.inventory_button = QPushButton("Product inventory")
+        self.inventory_button.clicked.connect(self.open_inventory_dialog)
         self.order_button = QPushButton("Create order")
         self.order_button.clicked.connect(self.open_order_dialog)
         self.vendor_details_button = QPushButton("Vendor details")
@@ -753,6 +1047,7 @@ class VendorManagerApp(QMainWindow):
         left_panel.addWidget(self.sync_vendor_button)
         left_panel.addWidget(self.sync_all_button)
         left_panel.addWidget(self.reset_vendor_button)
+        left_panel.addWidget(self.inventory_button)
         left_panel.addWidget(self.order_button)
         left_panel.addWidget(self.vendor_details_button)
 
@@ -1058,6 +1353,15 @@ class VendorManagerApp(QMainWindow):
             self._load_products_for_vendor(vendor)
         self._refresh_all_stats()
         QMessageBox.information(self, "Sync complete", f"{len(products)} products synced for {vendor}.")
+
+    def open_inventory_dialog(self) -> None:
+        if not self.current_vendor:
+            QMessageBox.warning(self, "No vendor selected", "Please select a vendor before opening product inventory.")
+            return
+        dialog = InventoryDialog(self.current_vendor, self.vendor_names, self.db, parent=self)
+        dialog.exec_()
+        self._load_products_for_vendor(self.current_vendor)
+        self._refresh_all_stats()
 
     def open_order_dialog(self) -> None:
         if not self.current_vendor:

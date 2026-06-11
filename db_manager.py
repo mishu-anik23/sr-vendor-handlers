@@ -204,6 +204,22 @@ class DatabaseManager:
         cursor = self._execute(f"SELECT * FROM `{table_name}` ORDER BY product_name COLLATE NOCASE")
         return [dict(row) for row in cursor.fetchall()]
 
+    def update_vendor_product(self, vendor: str, sku: str, update_data: Dict[str, Any]) -> None:
+        table_name = self.vendor_table_name(vendor)
+        cursor = self.conn.cursor()
+        
+        fields = []
+        values = []
+        for k, v in update_data.items():
+            fields.append(f"{k} = ?")
+            values.append(v)
+            
+        values.append(sku)
+        
+        query = f"UPDATE `{table_name}` SET {', '.join(fields)} WHERE sku = ?"
+        cursor.execute(query, values)
+        self.conn.commit()
+
     def get_vendor_statistics(self, vendor: str) -> Dict[str, Any]:
         table_name = self.vendor_table_name(vendor)
         self.create_vendor_table(vendor)

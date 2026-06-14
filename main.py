@@ -1022,6 +1022,19 @@ class VendorManagerApp(QMainWindow):
         self._load_sidebar()
         self._refresh_all_stats()
 
+        # Start web server for mobile access
+        try:
+            from web_server import start_web_server
+            url = start_web_server(self.db, lambda: self.vendor_names)
+            if "cryptography" in url:
+                real_url = url.split(" (")[0]
+                self.server_info_label.setText(f"<b>Mobile Server:</b><br><a href='{real_url}'>{real_url}</a><br><small style='color:red;'>Run <b>pip install cryptography</b> for camera!</small>")
+            else:
+                self.server_info_label.setText(f"<b>Mobile Server:</b><br><a href='{url}'>{url}</a><br><small>Accept browser security warnings for local IP.</small>")
+            self.server_info_label.setOpenExternalLinks(True)
+        except ImportError:
+            self.server_info_label.setText("Install 'flask' to enable mobile access.")
+
     def _build_ui(self) -> None:
         root = QWidget()
         main_layout = QHBoxLayout(root)
@@ -1044,12 +1057,19 @@ class VendorManagerApp(QMainWindow):
         self.order_button.clicked.connect(self.open_order_dialog)
         self.vendor_details_button = QPushButton("Vendor details")
         self.vendor_details_button.clicked.connect(self.open_vendor_details)
+        self.refresh_view_button = QPushButton("Refresh product list")
+        self.refresh_view_button.clicked.connect(self.refresh_product_list)
         left_panel.addWidget(self.sync_vendor_button)
         left_panel.addWidget(self.sync_all_button)
         left_panel.addWidget(self.reset_vendor_button)
         left_panel.addWidget(self.inventory_button)
         left_panel.addWidget(self.order_button)
         left_panel.addWidget(self.vendor_details_button)
+        left_panel.addWidget(self.refresh_view_button)
+        
+        left_panel.addStretch()
+        self.server_info_label = QLabel("Initializing server...")
+        left_panel.addWidget(self.server_info_label)
 
         right_panel = QVBoxLayout()
         header = QHBoxLayout()
@@ -1197,6 +1217,11 @@ class VendorManagerApp(QMainWindow):
             return
         self.current_vendor = selected_items[0].text()
         self._load_products_for_vendor(self.current_vendor)
+
+    def refresh_product_list(self) -> None:
+        if self.current_vendor:
+            self._load_products_for_vendor(self.current_vendor)
+            self._refresh_all_stats()
 
     def _load_products_for_vendor(self, vendor: str) -> None:
         self.product_table.setRowCount(0)

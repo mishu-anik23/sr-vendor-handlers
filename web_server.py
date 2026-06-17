@@ -480,11 +480,11 @@ def load_excel():
         
         # Parse Excel file
         excel_file = io.BytesIO(response.content)
-        xls = pd.ExcelFile(excel_file)
+        xls = pd.ExcelFile(excel_file, engine='openpyxl')
         
         sheets_data = {}
         for sheet_name in xls.sheet_names:
-            df = pd.read_excel(excel_file, sheet_name=sheet_name)
+            df = pd.read_excel(excel_file, sheet_name=sheet_name, engine='openpyxl')
             # Convert DataFrame to list of dictionaries, handling NaN values
             records = df.where(pd.notna(df), None).to_dict('records')
             sheets_data[sheet_name] = records

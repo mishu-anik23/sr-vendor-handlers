@@ -98,11 +98,11 @@ class SRProductsArchiveDialog(QDialog):
             
             # Parse Excel
             excel_file = io.BytesIO(response.content)
-            xls = pd.ExcelFile(excel_file)
+            xls = pd.ExcelFile(excel_file, engine='openpyxl')
             
             self.sheets_data = {}
             for sheet_name in xls.sheet_names:
-                df = pd.read_excel(excel_file, sheet_name=sheet_name)
+                df = pd.read_excel(excel_file, sheet_name=sheet_name, engine='openpyxl')
                 self.sheets_data[sheet_name] = df
             
             self._display_sheets()

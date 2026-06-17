@@ -2,7 +2,10 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import io
 
+import pandas as pd
+import requests
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QIcon, QPixmap
 from PyQt5.QtWidgets import (
@@ -20,11 +23,12 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
-    QWidget, QHBoxLayout, QSpinBox,
+    QWidget, QHBoxLayout, QSpinBox, QScrollArea,
 )
 
 from db_manager import DatabaseManager
@@ -35,6 +39,102 @@ COMPANY_ADDRESS = "Schwarzwald Straße 27, 60528 Frankfurt"
 LOGO_FILE = Path(__file__).resolve().parent / "logo-sr-tmp.jpeg"
 DB_FILE = Path(__file__).resolve().parent / "data" / "vendor_app.db"
 VENDOR_ROOT = Path(__file__).resolve().parent / "data" / "vendors"
+
+
+class SRProductsArchiveDialog(QDialog):
+    """Dialog for loading and viewing Excel sheets from Dropbox"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("SR Products Archive")
+        self.setMinimumSize(1200, 700)
+        self.sheets_data = {}
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        
+        # URL input section
+        url_layout = QHBoxLayout()
+        url_layout.addWidget(QLabel("Dropbox Excel Sheet URL:"))
+        self.url_input = QLineEdit()
+        self.url_input.setPlaceholderText("https://www.dropbox.com/...")
+        url_layout.addWidget(self.url_input)
+        
+        load_btn = QPushButton("Load Sheet")
+        load_btn.clicked.connect(self.load_sheet)
+        url_layout.addWidget(load_btn)
+        layout.addLayout(url_layout)
+        
+        # Tab widget for sheets
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setVisible(False)
+        layout.addWidget(self.tab_widget)
+        
+        # Status/message label
+        self.status_label = QLabel("Enter a Dropbox URL and click 'Load Sheet'")
+        layout.addWidget(self.status_label)
+
+    def load_sheet(self) -> None:
+        url = self.url_input.text().strip()
+        if not url:
+            QMessageBox.warning(self, "Error", "Please enter a Dropbox URL.")
+            return
+        
+        self.status_label.setText("Loading...")
+        self.tab_widget.setVisible(False)
+        
+        try:
+            # Convert Dropbox sharing URL to direct download
+            if 'dropbox.com' in url:
+                if '?dl=0' in url:
+                    url = url.replace('?dl=0', '?dl=1')
+                elif '?dl=1' not in url:
+                    url = url + '?dl=1'
+            
+            # Fetch file
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            response = requests.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+            
+            # Parse Excel
+            excel_file = io.BytesIO(response.content)
+            xls = pd.ExcelFile(excel_file)
+            
+            self.sheets_data = {}
+            for sheet_name in xls.sheet_names:
+                df = pd.read_excel(excel_file, sheet_name=sheet_name)
+                self.sheets_data[sheet_name] = df
+            
+            self._display_sheets()
+            self.status_label.setText(f"Successfully loaded {len(self.sheets_data)} sheet(s)")
+            self.tab_widget.setVisible(True)
+            
+        except requests.exceptions.RequestException as e:
+            self.status_label.setText(f"Error: Failed to fetch file - {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to fetch file:\n{str(e)}")
+        except Exception as e:
+            self.status_label.setText(f"Error: Failed to parse file - {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to parse Excel file:\n{str(e)}")
+
+    def _display_sheets(self) -> None:
+        self.tab_widget.clear()
+        
+        for sheet_name, df in self.sheets_data.items():
+            # Create table for this sheet
+            table = QTableWidget()
+            table.setColumnCount(len(df.columns))
+            table.setRowCount(len(df))
+            table.setHorizontalHeaderLabels([str(col) for col in df.columns])
+            table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+            
+            # Fill table with data
+            for row_idx, (_, row_data) in enumerate(df.iterrows()):
+                for col_idx, value in enumerate(row_data):
+                    item = QTableWidgetItem(str(value) if value is not None and str(value) != 'nan' else '')
+                    table.setItem(row_idx, col_idx, item)
+            
+            # Add table to tab widget
+            self.tab_widget.addTab(table, sheet_name)
 
 
 class OrderDialog(QDialog):
@@ -1059,6 +1159,8 @@ class VendorManagerApp(QMainWindow):
         self.vendor_details_button.clicked.connect(self.open_vendor_details)
         self.refresh_view_button = QPushButton("Refresh product list")
         self.refresh_view_button.clicked.connect(self.refresh_product_list)
+        self.archive_button = QPushButton("SR Products Archive")
+        self.archive_button.clicked.connect(self.open_archive_dialog)
         left_panel.addWidget(self.sync_vendor_button)
         left_panel.addWidget(self.sync_all_button)
         left_panel.addWidget(self.reset_vendor_button)
@@ -1066,6 +1168,7 @@ class VendorManagerApp(QMainWindow):
         left_panel.addWidget(self.order_button)
         left_panel.addWidget(self.vendor_details_button)
         left_panel.addWidget(self.refresh_view_button)
+        left_panel.addWidget(self.archive_button)
         
         left_panel.addStretch()
         self.server_info_label = QLabel("Initializing server...")
@@ -1294,6 +1397,10 @@ class VendorManagerApp(QMainWindow):
         dialog = VendorProfileDialog(self.current_vendor, profile, self.db, parent=self)
         if dialog.exec_():
             self._load_vendor_profile_summary(self.current_vendor)
+
+    def open_archive_dialog(self) -> None:
+        dialog = SRProductsArchiveDialog(parent=self)
+        dialog.exec_()
 
     def _display_sku(self, product: dict) -> str:
         import json

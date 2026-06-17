@@ -2,6 +2,9 @@ import socket
 import threading
 from datetime import datetime
 from flask import Flask, jsonify, request, render_template_string
+import pandas as pd
+import io
+import requests
 
 app = Flask(__name__)
 _db = None
@@ -30,14 +33,30 @@ HTML_TEMPLATE = """
         .btn-edit:hover { background: #0056b3; }
         .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; overflow-y: auto; }
         .modal-content { background: white; margin: 20px auto; padding: 20px; width: 90%; max-width: 400px; border-radius: 8px; box-sizing: border-box; }
+        .modal-content-large { background: white; margin: 20px auto; padding: 20px; width: 95%; max-width: 1200px; border-radius: 8px; box-sizing: border-box; max-height: 90vh; overflow-y: auto; }
         .field-row { margin-bottom: 10px; }
         .field-row label { display: block; font-weight: bold; margin-bottom: 5px; font-size: 14px; }
         .btn-save { background: #28a745; color: white; border: none; padding: 12px; border-radius: 5px; cursor: pointer; width: 100%; font-size: 16px; margin-top: 10px; }
         .btn-cancel { background: #dc3545; color: white; border: none; padding: 12px; border-radius: 5px; cursor: pointer; width: 100%; font-size: 16px; margin-top: 10px; }
+        .btn-archive { background: #6c757d; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; font-size: 16px; white-space: nowrap; margin-top: 10px; width: 100%; }
+        .btn-archive:hover { background: #5a6268; }
+        .btn-load { background: #007bff; color: white; border: none; padding: 12px; border-radius: 5px; cursor: pointer; width: 100%; font-size: 16px; margin-top: 10px; }
+        .btn-load:hover { background: #0056b3; }
+        .sheet-tabs { display: flex; gap: 5px; margin-bottom: 15px; flex-wrap: wrap; }
+        .sheet-tab { padding: 10px 15px; background: #e9ecef; border: 1px solid #ccc; border-radius: 5px 5px 0 0; cursor: pointer; font-size: 14px; }
+        .sheet-tab.active { background: #007bff; color: white; border-color: #007bff; }
+        .sheet-content { display: none; }
+        .sheet-content.active { display: block; }
+        .data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        .data-table th { background: #f8f9fa; border: 1px solid #ddd; padding: 8px; text-align: left; font-weight: bold; }
+        .data-table td { border: 1px solid #ddd; padding: 8px; }
+        .data-table tr:nth-child(even) { background: #f9f9f9; }
+        .data-table tr:hover { background: #f0f0f0; }
         .toast { visibility: hidden; min-width: 250px; background-color: #333; color: #fff; text-align: center; border-radius: 2px; padding: 16px; position: fixed; z-index: 1; left: 50%; bottom: 30px; font-size: 17px; transform: translateX(-50%); }
         .toast.show { visibility: visible; animation: fadein 0.5s, fadeout 0.5s 2.5s; }
-        @keyframes fadein { from {bottom: 0; opacity: 0;} to {bottom: 30px; opacity: 1;} }
-        @keyframes fadeout { from {bottom: 30px; opacity: 1;} to {bottom: 0; opacity: 0;} }
+        .loading { text-align: center; padding: 20px; }
+        .spinner { border: 4px solid #f3f3f3; border-top: 4px solid #007bff; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 0 auto; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
@@ -56,6 +75,7 @@ HTML_TEMPLATE = """
         <select id="brand-select" onchange="filterProducts()">
             <option value="">All Brands</option>
         </select>
+        <button class="btn-archive" onclick="openArchiveWidget()">SR Products Archive</button>
     </div>
     
     <div id="product-list"></div>
@@ -89,6 +109,22 @@ HTML_TEMPLATE = """
             <h3 style="margin-top: 0;">Scan Barcode</h3>
             <div id="reader" style="width: 100%;"></div>
             <button class="btn-cancel" onclick="closeScanner()">Cancel</button>
+        </div>
+    </div>
+
+    <div id="archive-modal" class="modal" style="z-index: 1050;">
+        <div class="modal-content-large">
+            <h3 style="margin-top: 0; display: flex; justify-content: space-between; align-items: center;">
+                SR Products Archive
+                <button onclick="closeArchiveWidget()" style="background: none; border: none; font-size: 24px; cursor: pointer;">&times;</button>
+            </h3>
+            <div class="field-row">
+                <label>Dropbox Excel Sheet URL:</label>
+                <input type="text" id="dropbox-url" placeholder="https://www.dropbox.com/..." style="font-size: 14px;">
+                <small style="color: #666; margin-top: 5px; display: block;">Paste the Dropbox Excel file link here</small>
+            </div>
+            <button class="btn-load" onclick="loadDropboxSheet()">Load Sheet</button>
+            <div id="archive-content" style="margin-top: 20px;"></div>
         </div>
     </div>
 
@@ -264,6 +300,128 @@ HTML_TEMPLATE = """
             x.className = "toast show";
             setTimeout(function(){ x.className = x.className.replace("show", ""); }, 3000);
         }
+
+        // Archive Widget Functions
+        function openArchiveWidget() {
+            document.getElementById('archive-modal').style.display = 'block';
+        }
+
+        function closeArchiveWidget() {
+            document.getElementById('archive-modal').style.display = 'none';
+            document.getElementById('archive-content').innerHTML = '';
+            document.getElementById('dropbox-url').value = '';
+        }
+
+        async function loadDropboxSheet() {
+            const url = document.getElementById('dropbox-url').value.trim();
+            if (!url) {
+                alert('Please enter a Dropbox URL');
+                return;
+            }
+
+            const archiveContent = document.getElementById('archive-content');
+            archiveContent.innerHTML = '<div class="loading"><div class="spinner"></div><p>Loading...</p></div>';
+
+            try {
+                const response = await fetch('/api/load-excel', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: url })
+                });
+
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.error || 'Failed to load file');
+                }
+
+                const data = await response.json();
+                displaySheets(data.sheets);
+            } catch (e) {
+                archiveContent.innerHTML = `<div style="color: red; padding: 20px; background: #ffe0e0; border-radius: 5px;"><b>Error:</b> ${e.message}</div>`;
+            }
+        }
+
+        function displaySheets(sheets) {
+            const archiveContent = document.getElementById('archive-content');
+            archiveContent.innerHTML = '';
+
+            if (!sheets || Object.keys(sheets).length === 0) {
+                archiveContent.innerHTML = '<p>No sheets found in the Excel file.</p>';
+                return;
+            }
+
+            const sheetNames = Object.keys(sheets);
+            
+            // Create tabs
+            const tabsContainer = document.createElement('div');
+            tabsContainer.className = 'sheet-tabs';
+
+            sheetNames.forEach((sheetName, index) => {
+                const tab = document.createElement('button');
+                tab.className = `sheet-tab ${index === 0 ? 'active' : ''}`;
+                tab.textContent = sheetName;
+                tab.onclick = () => switchSheet(sheetName);
+                tabsContainer.appendChild(tab);
+            });
+
+            archiveContent.appendChild(tabsContainer);
+
+            // Create sheet contents
+            sheetNames.forEach((sheetName, index) => {
+                const sheetDiv = document.createElement('div');
+                sheetDiv.id = `sheet-${sheetName}`;
+                sheetDiv.className = `sheet-content ${index === 0 ? 'active' : ''}`;
+                sheetDiv.innerHTML = renderTable(sheets[sheetName]);
+                archiveContent.appendChild(sheetDiv);
+            });
+        }
+
+        function switchSheet(sheetName) {
+            // Hide all sheets
+            document.querySelectorAll('.sheet-content').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.sheet-tab').forEach(el => el.classList.remove('active'));
+
+            // Show selected sheet
+            document.getElementById(`sheet-${sheetName}`).classList.add('active');
+            event.target.classList.add('active');
+        }
+
+        function renderTable(data) {
+            if (!data || data.length === 0) {
+                return '<p>No data in this sheet.</p>';
+            }
+
+            const headers = Object.keys(data[0]);
+            let html = '<table class="data-table"><thead><tr>';
+            
+            headers.forEach(header => {
+                html += `<th>${escapeHtml(header)}</th>`;
+            });
+            html += '</tr></thead><tbody>';
+
+            data.forEach(row => {
+                html += '<tr>';
+                headers.forEach(header => {
+                    const value = row[header];
+                    html += `<td>${escapeHtml(value !== null && value !== undefined ? value : '')}</td>`;
+                });
+                html += '</tr>';
+            });
+
+            html += '</tbody></table>';
+            return html;
+        }
+
+        function escapeHtml(text) {
+            const map = {
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#039;'
+            };
+            return String(text).replace(/[&<>"']/g, m => map[m]);
+        }
     </script>
 </body>
 </html>
@@ -297,6 +455,46 @@ def update_inventory(vendor, sku):
         return jsonify({"status": "success"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route('/api/load-excel', methods=['POST'])
+def load_excel():
+    try:
+        data = request.json
+        url = data.get('url', '').strip()
+        
+        if not url:
+            return jsonify({"error": "URL is required"}), 400
+        
+        # Convert Dropbox sharing URL to direct download URL
+        if 'dropbox.com' in url:
+            # Replace the end parameter from ?dl=0 to ?dl=1 for direct download
+            if '?dl=0' in url:
+                url = url.replace('?dl=0', '?dl=1')
+            elif '?dl=1' not in url:
+                url = url + '?dl=1'
+        
+        # Fetch the file
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+        
+        # Parse Excel file
+        excel_file = io.BytesIO(response.content)
+        xls = pd.ExcelFile(excel_file)
+        
+        sheets_data = {}
+        for sheet_name in xls.sheet_names:
+            df = pd.read_excel(excel_file, sheet_name=sheet_name)
+            # Convert DataFrame to list of dictionaries, handling NaN values
+            records = df.where(pd.notna(df), None).to_dict('records')
+            sheets_data[sheet_name] = records
+        
+        return jsonify({"sheets": sheets_data})
+    
+    except requests.exceptions.RequestException as e:
+        return jsonify({"error": f"Failed to fetch file: {str(e)}"}), 400
+    except Exception as e:
+        return jsonify({"error": f"Failed to parse Excel file: {str(e)}"}), 400
 
 def start_web_server(db, get_vendors_callback):
     global _db, _get_vendors

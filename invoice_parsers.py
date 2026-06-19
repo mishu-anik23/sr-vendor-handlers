@@ -49,11 +49,44 @@ class AsiaExpressInvoiceParser(BaseInvoiceParser):
         ae.write_excel(meta, rows, str(out_path))
 
 
+class IFTInvoiceParser(BaseInvoiceParser):
+    def parse(self, pdf_path: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        import pdf_invoice_to_excel_ift as ift
+        return ift.parse_pdf(str(pdf_path))
+        
+    def write_excel(self, meta: Dict[str, Any], rows: List[Dict[str, Any]], out_path: Path) -> None:
+        import pdf_invoice_to_excel_ift as ift
+        ift.write_excel(meta, rows, str(out_path))
+
+
+class EurFrozenInvoiceParser(BaseInvoiceParser):
+    def parse(self, pdf_path: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        import pdf_invoice_to_excel_eurfrozen as eurfrozen
+        return eurfrozen.parse_pdf(str(pdf_path))
+        
+    def write_excel(self, meta: Dict[str, Any], rows: List[Dict[str, Any]], out_path: Path) -> None:
+        import pdf_invoice_to_excel_eurfrozen as eurfrozen
+        eurfrozen.write_excel(meta, rows, str(out_path))
+
+
+class CKInvoiceParser(BaseInvoiceParser):
+    def parse(self, pdf_path: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        import pdf_invoice_to_excel_ck as ck
+        return ck.parse_pdf(str(pdf_path))
+        
+    def write_excel(self, meta: Dict[str, Any], rows: List[Dict[str, Any]], out_path: Path) -> None:
+        import pdf_invoice_to_excel_ck as ck
+        ck.write_excel(meta, rows, str(out_path))
+
+
 # Registry mapping vendor directory names to parser instances
 PARSERS: Dict[str, BaseInvoiceParser] = {
     "gft": GFTInvoiceParser(),
     "unidex": UnidexInvoiceParser(),
     "asiaexpress": AsiaExpressInvoiceParser(),
+    "ift": IFTInvoiceParser(),
+    "eurfrozen": EurFrozenInvoiceParser(),
+    "ck": CKInvoiceParser(),
 }
 
 def get_parser(vendor_name: str) -> BaseInvoiceParser:

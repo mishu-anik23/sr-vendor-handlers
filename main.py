@@ -292,6 +292,19 @@ class SRVendorInvoicesDialog(QDialog):
         self.download_btn.setEnabled(False)
         header_layout.addWidget(self.download_btn)
 
+        # Add Purchase Archives and All Unique Products buttons to the toolbar
+        self.archive_btn = QPushButton("Purchase Archives")
+        self.archive_btn.setStyleSheet("background-color: #17a2b8; color: white; padding: 6px 12px; font-weight: bold; border-radius: 4px;")
+        self.archive_btn.clicked.connect(self.show_purchase_archives)
+        self.archive_btn.setEnabled(True)
+        header_layout.addWidget(self.archive_btn)
+
+        self.all_unique_btn = QPushButton("All Unique Products")
+        self.all_unique_btn.setStyleSheet("background-color: #6f42c1; color: white; padding: 6px 12px; font-weight: bold; border-radius: 4px;")
+        self.all_unique_btn.clicked.connect(self.show_all_unique_products)
+        self.all_unique_btn.setEnabled(True)
+        header_layout.addWidget(self.all_unique_btn)
+
         right_layout.addLayout(header_layout)
 
         # Main display tabs (PDF View vs Excel View)
@@ -331,6 +344,16 @@ class SRVendorInvoicesDialog(QDialog):
         self.table_meta = QTableWidget()
         self.table_meta.setStyleSheet("QHeaderView::section { background-color: #f2f2f2; font-weight: bold; }")
         self.excel_tabs.addTab(self.table_meta, "Statistics")
+
+        # Sub tab 3: Purchase Archives Table
+        self.table_archive = QTableWidget()
+        self.table_archive.setStyleSheet("QHeaderView::section { background-color: #f2f2f2; font-weight: bold; }")
+        self.excel_tabs.addTab(self.table_archive, "Purchase Archives")
+
+        # Sub tab 4: Unique Products Table
+        self.table_unique = QTableWidget()
+        self.table_unique.setStyleSheet("QHeaderView::section { background-color: #f2f2f2; font-weight: bold; }")
+        self.excel_tabs.addTab(self.table_unique, "Unique Products")
 
         excel_layout.addWidget(self.excel_tabs)
         self.tabs.addTab(self.excel_tab, "Parsed Excel Data")
@@ -401,6 +424,8 @@ class SRVendorInvoicesDialog(QDialog):
         # Reset parsed data
         self.parsed_meta = None
         self.parsed_rows = None
+        self.archive_rows = []
+        self.unique_rows = []
         self.tabs.setTabEnabled(1, False)
         self.download_btn.setEnabled(False)
         self.tabs.setCurrentIndex(0)
@@ -456,6 +481,140 @@ class SRVendorInvoicesDialog(QDialog):
         finally:
             QApplication.restoreOverrideCursor()
 
+    def load_merged_history(self) -> Optional[pd.DataFrame]:
+        if not self.selected_vendor:
+            return None
+            
+        vendor_lower = self.selected_vendor.lower()
+        workspace_root = Path(r"c:\Users\mdtou\PycharmProjects\sr-vendor-handlers")
+        
+        # Candidate 1: merged_<vendor>.xlsx
+        path = workspace_root / f"merged_{vendor_lower}.xlsx"
+        if not path.exists() and vendor_lower == "gft":
+            # Candidate 2: merged.xlsx
+            path = workspace_root / "merged.xlsx"
+            
+        # Try general scanning
+        if not path.exists():
+            for f in workspace_root.glob("merged_*.xlsx"):
+                if vendor_lower in f.name.lower():
+                    path = f
+                    break
+                    
+        if not path.exists():
+            return None
+            
+        try:
+            df = pd.read_excel(path, sheet_name="Invoice Data")
+            return df
+        except Exception as e:
+            print(f"Error loading merged history from {path}: {e}")
+            return None
+
+    def get_product_id_column(self, df: pd.DataFrame) -> Optional[str]:
+        # Common item code column names
+        candidates = ["item no.", "artnr", "article", "code", "article number", "itemcode"]
+        for col in df.columns:
+            if str(col).lower() in candidates:
+                return col
+        return df.columns[0] if len(df.columns) > 0 else None
+
+    def show_purchase_archives(self) -> None:
+        if not self.selected_vendor:
+            QMessageBox.warning(self, "No Vendor", "Please select a vendor first.")
+            return
+            
+        df = self.load_merged_history()
+        if df is None or df.empty:
+            QMessageBox.information(self, "No Archive", f"No purchase archive (merged Excel file) found for vendor '{self.selected_vendor}'.")
+            return
+            
+        # Convert df to rows list of dicts to use our helper
+        rows = df.to_dict(orient="records")
+        
+        # Populate table_archive
+        self.populate_table(self.table_archive, rows)
+        
+        # Enable Excel view and switch to the archive tab
+        self.tabs.setTabEnabled(1, True)
+        self.tabs.setCurrentIndex(1)
+        self.excel_tabs.setCurrentIndex(2) # "Purchase Archives" tab is index 2
+        self.status_label.setText(f"Loaded {len(rows)} products from historical archive.")
+
+    def show_all_unique_products(self) -> None:
+        if not self.selected_vendor:
+            QMessageBox.warning(self, "No Vendor", "Please select a vendor first.")
+            return
+            
+        df = self.load_merged_history()
+        if df is None or df.empty:
+            QMessageBox.information(self, "No Archive", f"No purchase archive (merged Excel file) found for vendor '{self.selected_vendor}'.")
+            return
+
+        # Try parsing dates chronologically
+        date_col = None
+        for c in ["invoice date", "datum", "date"]:
+            for actual_col in df.columns:
+                if str(actual_col).lower() == c:
+                    date_col = actual_col
+                    break
+            if date_col:
+                break
+                
+        if date_col:
+            df = df.copy()
+            df["_parsed_date"] = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce")
+            df = df.sort_values(by="_parsed_date", ascending=True)
+
+        id_col = self.get_product_id_column(df)
+        if not id_col:
+            QMessageBox.warning(self, "Error", "Could not find product code column in merged data.")
+            return
+
+        seen = set()
+        unique_rows = []
+        for _, row in df.iterrows():
+            pid = str(row[id_col]).strip()
+            if pid not in seen:
+                seen.add(pid)
+                row_dict = row.to_dict()
+                if "_parsed_date" in row_dict:
+                    del row_dict["_parsed_date"]
+                unique_rows.append(row_dict)
+
+        # Let's populate the unique table
+        self.populate_table(self.table_unique, unique_rows)
+        
+        # Let's generate statistics
+        stats_meta = {
+            "Total Unique Products": len(unique_rows),
+        }
+        
+        # Distinct invoices
+        inv_col = None
+        for c in ["invoice number", "rechn.nr.", "doc. nr.", "invoice_no", "invoice no"]:
+            for actual_col in df.columns:
+                if str(actual_col).lower() == c:
+                    inv_col = actual_col
+                    break
+            if inv_col:
+                break
+                
+        if inv_col:
+            stats_meta["Total Distinct Invoices"] = df[inv_col].nunique()
+            
+        if date_col and not df.empty:
+            stats_meta["First Purchase Date"] = df[date_col].iloc[0]
+            stats_meta["Last Purchase Date"] = df[date_col].iloc[-1]
+            
+        self.populate_meta_table(self.table_meta, stats_meta)
+        
+        # Switch tabs
+        self.tabs.setTabEnabled(1, True)
+        self.tabs.setCurrentIndex(1)
+        self.excel_tabs.setCurrentIndex(3) # "Unique Products" tab is index 3
+        self.status_label.setText(f"Computed {len(unique_rows)} total unique products in history.")
+
     def parse_selected_invoice(self) -> None:
         if not self.current_pdf_path:
             return
@@ -471,77 +630,104 @@ class SRVendorInvoicesDialog(QDialog):
         try:
             # Parse the PDF using modular parser
             meta, rows = parser.parse(self.current_pdf_path)
+            
+            # Load historical merged data
+            df_archive = self.load_merged_history()
+            
+            archive_rows = []
+            unique_current_rows = []
+            
+            if df_archive is not None and not df_archive.empty:
+                # Find product code column in current rows and archive df
+                id_col_current = None
+                if rows:
+                    id_col_current = self.get_product_id_column(pd.DataFrame(rows[:1]))
+                    
+                id_col_archive = self.get_product_id_column(df_archive)
+                
+                if id_col_current and id_col_archive:
+                    archived_ids = set(str(pid).strip() for pid in df_archive[id_col_archive].dropna())
+                    for r in rows:
+                        pid = str(r.get(id_col_current)).strip()
+                        if pid not in archived_ids:
+                            unique_current_rows.append(r)
+                else:
+                    unique_current_rows = rows
+                    
+                archive_rows = df_archive.to_dict(orient="records")
+            else:
+                unique_current_rows = rows
+                
+            meta["Unique Products Count"] = len(unique_current_rows)
+            
             self.parsed_meta = meta
             self.parsed_rows = rows
+            self.archive_rows = archive_rows
+            self.unique_rows = unique_current_rows
             
             # Populate tables in Excel tab
-            self.populate_excel_tables()
+            self.populate_table(self.table_items, self.parsed_rows)
+            self.populate_meta_table(self.table_meta, self.parsed_meta)
+            self.populate_table(self.table_archive, self.archive_rows)
+            self.populate_table(self.table_unique, self.unique_rows)
             
             # Enable Excel views
             self.tabs.setTabEnabled(1, True)
             self.tabs.setCurrentIndex(1)  # Automatically switch to excel preview
+            self.excel_tabs.setCurrentIndex(0) # Default to Invoice Data
             self.download_btn.setEnabled(True)
             self.status_label.setText("Successfully parsed invoice to Excel data.")
             
         except Exception as e:
             self.status_label.setText(f"Parsing failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
             QMessageBox.critical(self, "Parsing Error", f"Failed to parse invoice:\n{str(e)}")
         finally:
             QApplication.restoreOverrideCursor()
 
-    def populate_excel_tables(self) -> None:
-        # Populate items table
-        if self.parsed_rows:
-            self.table_items.clear()
-            headers = list(self.parsed_rows[0].keys())
-            self.table_items.setColumnCount(len(headers))
-            self.table_items.setHorizontalHeaderLabels(headers)
-            self.table_items.setRowCount(len(self.parsed_rows))
+    def populate_table(self, table: QTableWidget, data: List[Dict[str, Any]]) -> None:
+        table.clear()
+        if not data:
+            table.setRowCount(0)
+            table.setColumnCount(0)
+            return
             
-            for row_idx, row_data in enumerate(self.parsed_rows):
-                for col_idx, key in enumerate(headers):
-                    val = row_data.get(key)
-                    if isinstance(val, float):
-                        item = QTableWidgetItem(f"{val:.2f}")
+        headers = list(data[0].keys())
+        table.setColumnCount(len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setRowCount(len(data))
+        
+        for row_idx, row_data in enumerate(data):
+            for col_idx, key in enumerate(headers):
+                val = row_data.get(key)
+                if isinstance(val, float):
+                    item = QTableWidgetItem(f"{val:.2f}")
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                else:
+                    item = QTableWidgetItem(str(val) if val is not None else "")
+                    if isinstance(val, int):
                         item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                     else:
-                        item = QTableWidgetItem(str(val) if val is not None else "")
-                        if isinstance(val, int):
-                            item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                        else:
-                            item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-                    self.table_items.setItem(row_idx, col_idx, item)
-            self.table_items.resizeColumnsToContents()
-        else:
-            self.table_items.clear()
-            self.table_items.setRowCount(0)
-            self.table_items.setColumnCount(0)
+                        item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                table.setItem(row_idx, col_idx, item)
+        table.resizeColumnsToContents()
 
-        # Populate metadata table
-        if self.parsed_meta:
-            self.table_meta.clear()
-            self.table_meta.setColumnCount(2)
-            self.table_meta.setHorizontalHeaderLabels(["Field", "Value"])
-            self.table_meta.setRowCount(len(self.parsed_meta))
-            
-            for idx, (key, val) in enumerate(self.parsed_meta.items()):
-                self.table_meta.setItem(idx, 0, QTableWidgetItem(str(key)))
-                val_str = f"{val:.2f}" if isinstance(val, float) else str(val)
-                item = QTableWidgetItem(val_str if val is not None else "")
-                self.table_meta.setItem(idx, 1, item)
-            self.table_meta.resizeColumnsToContents()
-        else:
-            self.table_meta.clear()
-            self.table_meta.setRowCount(0)
-            self.table_meta.setColumnCount(0)
+    def populate_meta_table(self, table: QTableWidget, meta: Dict[str, Any]) -> None:
+        table.clear()
+        table.setColumnCount(2)
+        table.setHorizontalHeaderLabels(["Field", "Value"])
+        table.setRowCount(len(meta))
+        
+        for idx, (key, val) in enumerate(meta.items()):
+            table.setItem(idx, 0, QTableWidgetItem(str(key)))
+            val_str = f"{val:.2f}" if isinstance(val, float) else str(val)
+            item = QTableWidgetItem(val_str if val is not None else "")
+            table.setItem(idx, 1, item)
+        table.resizeColumnsToContents()
 
     def download_excel(self) -> None:
         if not self.current_pdf_path or not self.parsed_meta or not self.parsed_rows:
-            return
-
-        vendor_name = self.current_pdf_path.parent.parent.name
-        parser = get_parser(vendor_name)
-        if not parser:
             return
 
         default_name = f"{self.current_pdf_path.stem}_parsed.xlsx"
@@ -551,9 +737,31 @@ class SRVendorInvoicesDialog(QDialog):
             self.status_label.setText(f"Saving Excel to {file_name}...")
             QApplication.setOverrideCursor(Qt.WaitCursor)
             try:
-                parser.write_excel(self.parsed_meta, self.parsed_rows, Path(file_name))
+                # Write custom exporter with all 4 sheets
+                with pd.ExcelWriter(file_name, engine='openpyxl') as writer:
+                    # Sheet 1: Invoice Data
+                    pd.DataFrame(self.parsed_rows).to_excel(writer, sheet_name="Invoice Data", index=False)
+                    
+                    # Sheet 2: Statistics
+                    meta_df = pd.DataFrame(list(self.parsed_meta.items()), columns=["Field", "Value"])
+                    meta_df.to_excel(writer, sheet_name="Statistics", index=False)
+                    
+                    # Sheet 3: Purchase Archives
+                    archive_rows = getattr(self, "archive_rows", [])
+                    if archive_rows:
+                        pd.DataFrame(archive_rows).to_excel(writer, sheet_name="Purchase Archives", index=False)
+                    else:
+                        pd.DataFrame().to_excel(writer, sheet_name="Purchase Archives", index=False)
+                        
+                    # Sheet 4: Unique Products
+                    unique_rows = getattr(self, "unique_rows", [])
+                    if unique_rows:
+                        pd.DataFrame(unique_rows).to_excel(writer, sheet_name="Unique Products", index=False)
+                    else:
+                        pd.DataFrame().to_excel(writer, sheet_name="Unique Products", index=False)
+                        
                 self.status_label.setText(f"Excel saved to {file_name}")
-                QMessageBox.information(self, "Success", f"Invoice successfully parsed and Excel saved to:\n{file_name}")
+                QMessageBox.information(self, "Success", f"Invoice successfully parsed and Excel saved with 4 sheets to:\n{file_name}")
             except Exception as e:
                 self.status_label.setText(f"Failed to save Excel: {str(e)}")
                 QMessageBox.critical(self, "Error", f"Failed to save Excel file:\n{str(e)}")

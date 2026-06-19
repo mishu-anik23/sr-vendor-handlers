@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
-    QListWidget,
+    QListWidget, QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -29,10 +29,16 @@ from PyQt5.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
     QWidget, QHBoxLayout, QSpinBox, QScrollArea,
+    QFileDialog,
 )
 
 from db_manager import DatabaseManager
 from excel_loader import ExcelLoader
+import io
+import pypdfium2 as pdfium
+from PIL import Image
+from invoice_parsers import get_parser
+
 
 COMPANY_NAME = "Sunrise Supermarket"
 COMPANY_ADDRESS = "Schwarzwald Straße 27, 60528 Frankfurt"
@@ -48,6 +54,8 @@ class SRProductsArchiveDialog(QDialog):
         self.setWindowTitle("SR Products Archive")
         self.setMinimumSize(1200, 700)
         self.sheets_data = {}
+        self.raw_excel_content = None
+        self.processed_sheets = {}
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -63,6 +71,19 @@ class SRProductsArchiveDialog(QDialog):
         load_btn = QPushButton("Load Sheet")
         load_btn.clicked.connect(self.load_sheet)
         url_layout.addWidget(load_btn)
+
+        self.process_btn = QPushButton("Process Excel")
+        self.process_btn.setStyleSheet("background-color: #28a745; color: white;")
+        self.process_btn.clicked.connect(self.process_excel)
+        self.process_btn.setVisible(False)
+        url_layout.addWidget(self.process_btn)
+
+        self.download_btn = QPushButton("Download Processed")
+        self.download_btn.setStyleSheet("background-color: #17a2b8; color: white;")
+        self.download_btn.clicked.connect(self.download_processed)
+        self.download_btn.setVisible(False)
+        url_layout.addWidget(self.download_btn)
+
         layout.addLayout(url_layout)
         
         # Tab widget for sheets
@@ -86,15 +107,19 @@ class SRProductsArchiveDialog(QDialog):
         try:
             # Convert Dropbox sharing URL to direct download
             if 'dropbox.com' in url:
-                if '?dl=0' in url:
-                    url = url.replace('?dl=0', '?dl=1')
-                elif '?dl=1' not in url:
-                    url = url + '?dl=1'
+                url = url.replace('dl=0', 'dl=1')
+                if 'dl=1' not in url:
+                    if '?' in url:
+                        url += '&dl=1'
+                    else:
+                        url += '?dl=1'
             
             # Fetch file
             headers = {'User-Agent': 'Mozilla/5.0'}
             response = requests.get(url, headers=headers, timeout=30)
             response.raise_for_status()
+            
+            self.raw_excel_content = response.content
             
             # Parse Excel
             excel_file = io.BytesIO(response.content)
@@ -108,6 +133,8 @@ class SRProductsArchiveDialog(QDialog):
             self._display_sheets()
             self.status_label.setText(f"Successfully loaded {len(self.sheets_data)} sheet(s)")
             self.tab_widget.setVisible(True)
+            self.process_btn.setVisible(True)
+            self.download_btn.setVisible(False)
             
         except requests.exceptions.RequestException as e:
             self.status_label.setText(f"Error: Failed to fetch file - {str(e)}")
@@ -135,6 +162,396 @@ class SRProductsArchiveDialog(QDialog):
             
             # Add table to tab widget
             self.tab_widget.addTab(table, sheet_name)
+
+    def process_excel(self) -> None:
+        if not self.raw_excel_content:
+            QMessageBox.warning(self, "Error", "No Excel file loaded.")
+            return
+
+        self.status_label.setText("Processing...")
+        self.tab_widget.setVisible(False)
+        self.process_btn.setEnabled(False)
+        
+        try:
+            from product_parser import process_excel_dataframe
+            excel_file = io.BytesIO(self.raw_excel_content)
+            xls = pd.ExcelFile(excel_file, engine='openpyxl')
+            
+            self.processed_sheets = {}
+            
+            def find_item_column(columns):
+                for col in columns:
+                    if col.lower() in ['item', 'name', 'product name', 'description']:
+                        return col
+                for col in columns:
+                    if 'item' in col.lower() or 'name' in col.lower():
+                        return col
+                return None
+
+            for sheet_name in xls.sheet_names:
+                df = pd.read_excel(xls, sheet_name=sheet_name)
+                item_col = find_item_column(df.columns)
+                if item_col:
+                    processed_df = process_excel_dataframe(df, item_column=item_col)
+                else:
+                    processed_df = df
+                self.processed_sheets[sheet_name] = processed_df
+            
+            self.sheets_data = self.processed_sheets
+            self._display_sheets()
+            self.status_label.setText("Processing complete.")
+            self.tab_widget.setVisible(True)
+            self.download_btn.setVisible(True)
+            
+        except Exception as e:
+            self.status_label.setText(f"Error: Failed to process file - {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to process Excel file:\n{str(e)}")
+        finally:
+            self.process_btn.setEnabled(True)
+
+    def download_processed(self) -> None:
+        if not self.processed_sheets:
+            QMessageBox.warning(self, "Error", "No processed data to download.")
+            return
+        
+        options = QFileDialog.Options()
+        file_name, _ = QFileDialog.getSaveFileName(self, "Save Processed Excel", "processed_products.xlsx", "Excel Files (*.xlsx)", options=options)
+        if file_name:
+            try:
+                with pd.ExcelWriter(file_name, engine='openpyxl') as writer:
+                    for sheet_name, df in self.processed_sheets.items():
+                        df.to_excel(writer, sheet_name=sheet_name, index=False)
+                QMessageBox.information(self, "Success", "File saved successfully.")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to save file:\n{str(e)}")
+
+
+
+class SRVendorInvoicesDialog(QDialog):
+    """Dialog for listing, rendering, parsing, and downloading vendor PDF invoices"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Vendor Invoices Viewer")
+        self.setMinimumSize(1200, 800)
+        self.current_pdf_path = None
+        self.parsed_meta = None
+        self.parsed_rows = None
+        self._build_ui()
+        self.load_invoices()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+
+        # Splitter for left and right panels
+        splitter = QSplitter(Qt.Horizontal)
+        layout.addWidget(splitter)
+
+        # Left panel (Invoice List)
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 5, 0)
+
+        list_title = QLabel("Available Invoices")
+        list_title.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        left_layout.addWidget(list_title)
+
+        # Search bar
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Filter invoices...")
+        self.search_input.textChanged.connect(self.filter_invoices)
+        left_layout.addWidget(self.search_input)
+
+        self.invoice_list = QListWidget()
+        self.invoice_list.itemSelectionChanged.connect(self.on_invoice_selected)
+        left_layout.addWidget(self.invoice_list)
+
+        splitter.addWidget(left_widget)
+
+        # Right panel (Preview and Excel)
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(5, 0, 0, 0)
+
+        # Header with actions
+        header_layout = QHBoxLayout()
+        self.invoice_label = QLabel("No invoice selected")
+        self.invoice_label.setStyleSheet("font-weight: bold; font-size: 11pt; color: #333;")
+        header_layout.addWidget(self.invoice_label, 1)
+
+        self.parse_btn = QPushButton("To Excel")
+        self.parse_btn.setStyleSheet("background-color: #28a745; color: white; padding: 6px 12px; font-weight: bold; border-radius: 4px;")
+        self.parse_btn.clicked.connect(self.parse_selected_invoice)
+        self.parse_btn.setEnabled(False)
+        header_layout.addWidget(self.parse_btn)
+
+        self.download_btn = QPushButton("Download Excel")
+        self.download_btn.setStyleSheet("background-color: #007bff; color: white; padding: 6px 12px; font-weight: bold; border-radius: 4px;")
+        self.download_btn.clicked.connect(self.download_excel)
+        self.download_btn.setEnabled(False)
+        header_layout.addWidget(self.download_btn)
+
+        right_layout.addLayout(header_layout)
+
+        # Main display tabs (PDF View vs Excel View)
+        self.tabs = QTabWidget()
+        
+        # PDF Preview Tab
+        self.pdf_tab = QWidget()
+        pdf_layout = QVBoxLayout(self.pdf_tab)
+        pdf_layout.setContentsMargins(0, 5, 0, 0)
+        
+        self.pdf_scroll = QScrollArea()
+        self.pdf_scroll.setWidgetResizable(True)
+        self.pdf_scroll.setStyleSheet("background-color: #e0e0e0; border: 1px solid #ccc; border-radius: 4px;")
+        
+        # Initial empty placeholder
+        self.pdf_placeholder = QLabel("Select an invoice from the list to preview")
+        self.pdf_placeholder.setAlignment(Qt.AlignCenter)
+        self.pdf_placeholder.setStyleSheet("color: #777; font-size: 12pt;")
+        self.pdf_scroll.setWidget(self.pdf_placeholder)
+        
+        pdf_layout.addWidget(self.pdf_scroll)
+        self.tabs.addTab(self.pdf_tab, "PDF Preview")
+
+        # Parsed Excel Data Tab
+        self.excel_tab = QWidget()
+        excel_layout = QVBoxLayout(self.excel_tab)
+        excel_layout.setContentsMargins(0, 5, 0, 0)
+
+        self.excel_tabs = QTabWidget()
+        
+        # Sub tab 1: Invoice Items Table
+        self.table_items = QTableWidget()
+        self.table_items.setStyleSheet("QHeaderView::section { background-color: #f2f2f2; font-weight: bold; }")
+        self.excel_tabs.addTab(self.table_items, "Invoice Data")
+
+        # Sub tab 2: Statistics/Header Metadata
+        self.table_meta = QTableWidget()
+        self.table_meta.setStyleSheet("QHeaderView::section { background-color: #f2f2f2; font-weight: bold; }")
+        self.excel_tabs.addTab(self.table_meta, "Statistics")
+
+        excel_layout.addWidget(self.excel_tabs)
+        self.tabs.addTab(self.excel_tab, "Parsed Excel Data")
+        self.tabs.setTabEnabled(1, False)  # Disabled until parsed
+
+        right_layout.addWidget(self.tabs)
+
+        # Status footer
+        self.status_label = QLabel("Ready")
+        self.status_label.setStyleSheet("color: #555; padding-top: 5px;")
+        layout.addWidget(self.status_label)
+
+        # Splitter sizing
+        splitter.addWidget(right_widget)
+        splitter.setSizes([280, 920]) # ~1/4 to 3/4 ratio
+
+    def load_invoices(self) -> None:
+        self.invoice_list.clear()
+        if not VENDOR_ROOT.exists():
+            self.status_label.setText("Error: Vendor data directory not found.")
+            return
+
+        pdf_files = list(VENDOR_ROOT.glob("*/invoices/*.pdf"))
+        if not pdf_files:
+            self.status_label.setText("No PDF invoices found in vendor directories.")
+            item = QListWidgetItem("No invoices found")
+            item.setFlags(Qt.NoItemFlags)
+            self.invoice_list.addItem(item)
+            return
+
+        for pdf_path in sorted(pdf_files, key=lambda p: (p.parent.parent.name, p.name)):
+            vendor_name = pdf_path.parent.parent.name.capitalize()
+            item = QListWidgetItem(f"[{vendor_name}] {pdf_path.name}")
+            item.setData(Qt.UserRole, str(pdf_path))
+            self.invoice_list.addItem(item)
+
+        self.status_label.setText(f"Found {len(pdf_files)} PDF invoices.")
+
+    def filter_invoices(self) -> None:
+        search_text = self.search_input.text().lower()
+        for i in range(self.invoice_list.count()):
+            item = self.invoice_list.item(i)
+            if item.data(Qt.UserRole):
+                item.setHidden(search_text not in item.text().lower())
+
+    def on_invoice_selected(self) -> None:
+        selected_items = self.invoice_list.selectedItems()
+        if not selected_items:
+            return
+
+        item = selected_items[0]
+        pdf_path_str = item.data(Qt.UserRole)
+        if not pdf_path_str:
+            return
+
+        self.current_pdf_path = Path(pdf_path_str)
+        vendor_name = self.current_pdf_path.parent.parent.name
+        
+        self.invoice_label.setText(f"{vendor_name.capitalize()} Invoice: {self.current_pdf_path.name}")
+        self.status_label.setText(f"Loading preview for {self.current_pdf_path.name}...")
+        
+        # Reset parsed data
+        self.parsed_meta = None
+        self.parsed_rows = None
+        self.tabs.setTabEnabled(1, False)
+        self.download_btn.setEnabled(False)
+        self.tabs.setCurrentIndex(0)
+
+        # Check if parser is available
+        parser = get_parser(vendor_name)
+        if parser is not None:
+            self.parse_btn.setEnabled(True)
+            self.parse_btn.setToolTip("Click to convert PDF invoice to Excel data")
+            self.parse_btn.setStyleSheet("background-color: #28a745; color: white; padding: 6px 12px; font-weight: bold; border-radius: 4px;")
+        else:
+            self.parse_btn.setEnabled(False)
+            self.parse_btn.setToolTip(f"No parser available for vendor '{vendor_name}' yet.")
+            self.parse_btn.setStyleSheet("background-color: #6c757d; color: white; padding: 6px 12px; font-weight: bold; border-radius: 4px;")
+
+        # Render PDF pages
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            doc = pdfium.PdfDocument(str(self.current_pdf_path))
+            
+            container = QWidget()
+            container.setStyleSheet("background-color: #e0e0e0;")
+            scroll_layout = QVBoxLayout(container)
+            scroll_layout.setSpacing(15)
+            scroll_layout.setContentsMargins(10, 10, 10, 10)
+            
+            for i in range(len(doc)):
+                page = doc[i]
+                # Render to PIL Image
+                pil_img = page.render(scale=1.5).to_pil()
+                
+                # Convert PIL Image to QPixmap via BytesIO
+                buf = io.BytesIO()
+                pil_img.save(buf, format='PNG')
+                qimg = QImage()
+                qimg.loadFromData(buf.getvalue(), 'PNG')
+                pixmap = QPixmap.fromImage(qimg)
+                
+                label = QLabel()
+                label.setPixmap(pixmap)
+                label.setAlignment(Qt.AlignCenter)
+                label.setStyleSheet("border: 1px solid #bbb; background-color: white;")
+                scroll_layout.addWidget(label)
+                
+            self.pdf_scroll.setWidget(container)
+            self.status_label.setText(f"Loaded {self.current_pdf_path.name} ({len(doc)} pages).")
+        except Exception as e:
+            self.status_label.setText(f"Failed to render preview: {str(e)}")
+            placeholder = QLabel(f"Failed to render PDF preview:\n{str(e)}")
+            placeholder.setAlignment(Qt.AlignCenter)
+            placeholder.setStyleSheet("color: red; font-size: 11pt;")
+            self.pdf_scroll.setWidget(placeholder)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def parse_selected_invoice(self) -> None:
+        if not self.current_pdf_path:
+            return
+
+        vendor_name = self.current_pdf_path.parent.parent.name
+        parser = get_parser(vendor_name)
+        if not parser:
+            QMessageBox.warning(self, "No Parser", f"No parser registered for vendor '{vendor_name}'.")
+            return
+
+        self.status_label.setText(f"Parsing invoice using {vendor_name.capitalize()} parser...")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            # Parse the PDF using modular parser
+            meta, rows = parser.parse(self.current_pdf_path)
+            self.parsed_meta = meta
+            self.parsed_rows = rows
+            
+            # Populate tables in Excel tab
+            self.populate_excel_tables()
+            
+            # Enable Excel views
+            self.tabs.setTabEnabled(1, True)
+            self.tabs.setCurrentIndex(1)  # Automatically switch to excel preview
+            self.download_btn.setEnabled(True)
+            self.status_label.setText("Successfully parsed invoice to Excel data.")
+            
+        except Exception as e:
+            self.status_label.setText(f"Parsing failed: {str(e)}")
+            QMessageBox.critical(self, "Parsing Error", f"Failed to parse invoice:\n{str(e)}")
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def populate_excel_tables(self) -> None:
+        # Populate items table
+        if self.parsed_rows:
+            self.table_items.clear()
+            headers = list(self.parsed_rows[0].keys())
+            self.table_items.setColumnCount(len(headers))
+            self.table_items.setHorizontalHeaderLabels(headers)
+            self.table_items.setRowCount(len(self.parsed_rows))
+            
+            for row_idx, row_data in enumerate(self.parsed_rows):
+                for col_idx, key in enumerate(headers):
+                    val = row_data.get(key)
+                    if isinstance(val, float):
+                        item = QTableWidgetItem(f"{val:.2f}")
+                        item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    else:
+                        item = QTableWidgetItem(str(val) if val is not None else "")
+                        if isinstance(val, int):
+                            item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                        else:
+                            item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                    self.table_items.setItem(row_idx, col_idx, item)
+            self.table_items.resizeColumnsToContents()
+        else:
+            self.table_items.clear()
+            self.table_items.setRowCount(0)
+            self.table_items.setColumnCount(0)
+
+        # Populate metadata table
+        if self.parsed_meta:
+            self.table_meta.clear()
+            self.table_meta.setColumnCount(2)
+            self.table_meta.setHorizontalHeaderLabels(["Field", "Value"])
+            self.table_meta.setRowCount(len(self.parsed_meta))
+            
+            for idx, (key, val) in enumerate(self.parsed_meta.items()):
+                self.table_meta.setItem(idx, 0, QTableWidgetItem(str(key)))
+                val_str = f"{val:.2f}" if isinstance(val, float) else str(val)
+                item = QTableWidgetItem(val_str if val is not None else "")
+                self.table_meta.setItem(idx, 1, item)
+            self.table_meta.resizeColumnsToContents()
+        else:
+            self.table_meta.clear()
+            self.table_meta.setRowCount(0)
+            self.table_meta.setColumnCount(0)
+
+    def download_excel(self) -> None:
+        if not self.current_pdf_path or not self.parsed_meta or not self.parsed_rows:
+            return
+
+        vendor_name = self.current_pdf_path.parent.parent.name
+        parser = get_parser(vendor_name)
+        if not parser:
+            return
+
+        default_name = f"{self.current_pdf_path.stem}_parsed.xlsx"
+        options = QFileDialog.Options()
+        file_name, _ = QFileDialog.getSaveFileName(self, "Save Parsed Excel", default_name, "Excel Files (*.xlsx)", options=options)
+        if file_name:
+            self.status_label.setText(f"Saving Excel to {file_name}...")
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                parser.write_excel(self.parsed_meta, self.parsed_rows, Path(file_name))
+                self.status_label.setText(f"Excel saved to {file_name}")
+                QMessageBox.information(self, "Success", f"Invoice successfully parsed and Excel saved to:\n{file_name}")
+            except Exception as e:
+                self.status_label.setText(f"Failed to save Excel: {str(e)}")
+                QMessageBox.critical(self, "Error", f"Failed to save Excel file:\n{str(e)}")
+            finally:
+                QApplication.restoreOverrideCursor()
 
 
 class OrderDialog(QDialog):
@@ -1149,6 +1566,8 @@ class VendorManagerApp(QMainWindow):
         self.sync_vendor_button.clicked.connect(self.sync_selected_vendor)
         self.sync_all_button = QPushButton("Sync all vendors")
         self.sync_all_button.clicked.connect(self.sync_all_vendors)
+        self.invoices_button = QPushButton("Vendor Invoices")
+        self.invoices_button.clicked.connect(self.open_invoices_dialog)
         self.reset_vendor_button = QPushButton("Reset selected vendor products")
         self.reset_vendor_button.clicked.connect(self.reset_selected_vendor_products)
         self.inventory_button = QPushButton("Product inventory")
@@ -1163,6 +1582,7 @@ class VendorManagerApp(QMainWindow):
         self.archive_button.clicked.connect(self.open_archive_dialog)
         left_panel.addWidget(self.sync_vendor_button)
         left_panel.addWidget(self.sync_all_button)
+        left_panel.addWidget(self.invoices_button)
         left_panel.addWidget(self.reset_vendor_button)
         left_panel.addWidget(self.inventory_button)
         left_panel.addWidget(self.order_button)
@@ -1400,6 +1820,10 @@ class VendorManagerApp(QMainWindow):
 
     def open_archive_dialog(self) -> None:
         dialog = SRProductsArchiveDialog(parent=self)
+        dialog.exec_()
+
+    def open_invoices_dialog(self) -> None:
+        dialog = SRVendorInvoicesDialog(parent=self)
         dialog.exec_()
 
     def _display_sku(self, product: dict) -> str:

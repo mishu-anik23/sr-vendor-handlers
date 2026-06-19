@@ -565,7 +565,7 @@ class SRVendorInvoicesDialog(QDialog):
         finally:
             QApplication.restoreOverrideCursor()
 
-    def load_merged_history(self) -> Optional[pd.DataFrame]:
+    def get_merged_history_path(self) -> Optional[Path]:
         if not self.selected_vendor:
             return None
             
@@ -585,7 +585,11 @@ class SRVendorInvoicesDialog(QDialog):
                     path = f
                     break
                     
-        if not path.exists():
+        return path if path.exists() else None
+
+    def load_merged_history(self) -> Optional[pd.DataFrame]:
+        path = self.get_merged_history_path()
+        if not path:
             return None
             
         try:
@@ -664,7 +668,29 @@ class SRVendorInvoicesDialog(QDialog):
         self.populate_meta_table(self.table_meta, stats_meta)
         self.parsed_meta = stats_meta
         
-        # Calculate summary statistics for each invoice chronologically
+        # Load Statistics sheet from history to get correct total amounts
+        path = self.get_merged_history_path()
+        df_stat = None
+        if path:
+            try:
+                df_stat = pd.read_excel(path, sheet_name="Statistics")
+            except Exception as e:
+                print(f"Error loading Statistics sheet: {e}")
+
+        # Find columns in Statistics sheet
+        stat_inv_col = "Invoice Number"
+        stat_date_col = "Invoice Date"
+        stat_amt_col = "Total Amount"
+        
+        if df_stat is not None and not df_stat.empty:
+            for col in df_stat.columns:
+                if str(col).lower() in ["rechn.nr.", "invoice number", "invoice_no"]:
+                    stat_inv_col = col
+                if str(col).lower() in ["datum", "invoice date", "date"]:
+                    stat_date_col = col
+                if str(col).lower() in ["endbetrag eur", "total amount", "amount"]:
+                    stat_amt_col = col
+
         summary_rows = []
         if inv_col:
             df_chron = df.copy()
@@ -672,44 +698,87 @@ class SRVendorInvoicesDialog(QDialog):
                 df_chron["_parsed_date"] = pd.to_datetime(df_chron[date_col], dayfirst=True, errors="coerce")
                 df_chron = df_chron.sort_values(by="_parsed_date", ascending=True)
             
-            invoice_groups = {}
+            invoice_pids = {}
+            id_col = self.get_product_id_column(df_chron)
             for _, r in df_chron.iterrows():
                 inv_no = str(r[inv_col]).strip()
-                inv_date = str(r[date_col]).strip() if date_col else "N/A"
-                key = (inv_no, inv_date)
-                if key not in invoice_groups:
-                    invoice_groups[key] = []
-                invoice_groups[key].append(r)
+                if inv_no not in invoice_pids:
+                    invoice_pids[inv_no] = []
+                if id_col:
+                    invoice_pids[inv_no].append(str(r[id_col]).strip())
+
+            # If Statistics sheet was loaded, use its values
+            if df_stat is not None and not df_stat.empty:
+                df_stat_sorted = df_stat.copy()
+                df_stat_sorted["_parsed_date"] = pd.to_datetime(df_stat_sorted[stat_date_col], dayfirst=True, errors="coerce")
+                df_stat_sorted = df_stat_sorted.sort_values(by="_parsed_date", ascending=True)
                 
-            seen_pids = set()
-            id_col = self.get_product_id_column(df_chron)
-            amount_col = self.get_amount_column(df_chron)
-            
-            for (inv_no, inv_date), group_rows in invoice_groups.items():
-                total_amt = 0.0
-                unique_count = 0
-                for r in group_rows:
-                    if amount_col:
+                seen_pids = set()
+                for _, row_stat in df_stat_sorted.iterrows():
+                    inv_no = str(row_stat[stat_inv_col]).strip()
+                    inv_date = str(row_stat[stat_date_col]).strip()
+                    total_amt = float(row_stat[stat_amt_col]) if not pd.isna(row_stat[stat_amt_col]) else 0.0
+                    
+                    pids_in_inv = invoice_pids.get(inv_no, [])
+                    prod_count = len(pids_in_inv)
+                    if "product_count" in row_stat:
                         try:
-                            val = float(r[amount_col])
-                            if not pd.isna(val):
-                                total_amt += val
+                            prod_count = int(row_stat["product_count"])
                         except (ValueError, TypeError):
                             pass
-                    if id_col:
-                        pid = str(r[id_col]).strip()
+                            
+                    unique_count = 0
+                    for pid in pids_in_inv:
                         if pid not in seen_pids:
                             seen_pids.add(pid)
                             unique_count += 1
                             
-                summary_rows.append({
-                    "Invoice Number": inv_no,
-                    "Invoice Date": inv_date,
-                    "Total Amount": round(total_amt, 2),
-                    "Ordered Product Count": len(group_rows),
-                    "Unique Products Count": unique_count
-                })
+                    summary_rows.append({
+                        "Invoice Number": inv_no,
+                        "Invoice Date": inv_date,
+                        "Total Amount": round(total_amt, 2),
+                        "Ordered Product Count": prod_count,
+                        "Unique Products Count": unique_count
+                    })
+            else:
+                # Fallback to row summing if Statistics sheet is missing/empty
+                invoice_groups = {}
+                for _, r in df_chron.iterrows():
+                    inv_no = str(r[inv_col]).strip()
+                    inv_date = str(r[date_col]).strip() if date_col else "N/A"
+                    key = (inv_no, inv_date)
+                    if key not in invoice_groups:
+                        invoice_groups[key] = []
+                    invoice_groups[key].append(r)
+                    
+                seen_pids = set()
+                amount_col = self.get_amount_column(df_chron)
                 
+                for (inv_no, inv_date), group_rows in invoice_groups.items():
+                    total_amt = 0.0
+                    unique_count = 0
+                    for r in group_rows:
+                        if amount_col:
+                            try:
+                                val = float(r[amount_col])
+                                if not pd.isna(val):
+                                    total_amt += val
+                            except (ValueError, TypeError):
+                                pass
+                        if id_col:
+                            pid = str(r[id_col]).strip()
+                            if pid not in seen_pids:
+                                seen_pids.add(pid)
+                                unique_count += 1
+                                
+                    summary_rows.append({
+                        "Invoice Number": inv_no,
+                        "Invoice Date": inv_date,
+                        "Total Amount": round(total_amt, 2),
+                        "Ordered Product Count": len(group_rows),
+                        "Unique Products Count": unique_count
+                    })
+
             if date_col:
                 # Sort summary descending (latest invoice date first)
                 summary_rows.sort(

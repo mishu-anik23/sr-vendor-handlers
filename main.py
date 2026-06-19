@@ -234,6 +234,7 @@ class SRVendorInvoicesDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Vendor Invoices Viewer")
         self.setMinimumSize(1200, 800)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMinMaxButtonsHint)
         self.selected_vendor = selected_vendor
         self.current_pdf_path = None
         self.parsed_meta = None
@@ -265,7 +266,7 @@ class SRVendorInvoicesDialog(QDialog):
         left_layout.addWidget(self.search_input)
 
         self.invoice_list = QTableWidget(0, 2)
-        self.invoice_list.setHorizontalHeaderLabels(["Invoice File", "Invoice Date"])
+        self.invoice_list.setHorizontalHeaderLabels(["Invoice Date", "Invoice File"])
         self.invoice_list.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.invoice_list.setSelectionBehavior(QTableWidget.SelectRows)
         self.invoice_list.setSelectionMode(QTableWidget.SingleSelection)
@@ -436,24 +437,37 @@ class SRVendorInvoicesDialog(QDialog):
             self.invoice_list.setItem(0, 1, QTableWidgetItem(""))
             return
 
-        sorted_files = sorted(pdf_files, key=lambda p: (p.parent.parent.name, p.name))
-        self.invoice_list.setRowCount(len(sorted_files))
-        
-        for idx, pdf_path in enumerate(sorted_files):
+        # Collect invoice info
+        invoices_info = []
+        for pdf_path in pdf_files:
             vendor_name = pdf_path.parent.parent.name.capitalize()
             file_display = f"[{vendor_name}] {pdf_path.name}"
-            
-            # Fast date extraction
             invoice_date = self.extract_date_fast(pdf_path, vendor_name)
+            
+            # Parse date to datetime object for sorting descending
+            if invoice_date != "N/A":
+                parsed_date = pd.to_datetime(invoice_date, dayfirst=True, errors="coerce")
+                if pd.isna(parsed_date):
+                    parsed_date = pd.Timestamp.min
+            else:
+                parsed_date = pd.Timestamp.min
+                
+            invoices_info.append((parsed_date, pdf_path, file_display, invoice_date))
+
+        # Sort chronologically descending (latest date first)
+        invoices_info.sort(key=lambda x: x[0], reverse=True)
+
+        self.invoice_list.setRowCount(len(invoices_info))
+        for idx, (_, pdf_path, file_display, invoice_date) in enumerate(invoices_info):
+            item_date = QTableWidgetItem(invoice_date)
+            item_date.setTextAlignment(Qt.AlignCenter)
             
             item_file = QTableWidgetItem(file_display)
             item_file.setData(Qt.UserRole, str(pdf_path))
             
-            item_date = QTableWidgetItem(invoice_date)
-            item_date.setTextAlignment(Qt.AlignCenter)
-            
-            self.invoice_list.setItem(idx, 0, item_file)
-            self.invoice_list.setItem(idx, 1, item_date)
+            # Swapped columns: Date is column 0, File is column 1
+            self.invoice_list.setItem(idx, 0, item_date)
+            self.invoice_list.setItem(idx, 1, item_file)
 
         self.invoice_list.resizeColumnsToContents()
         self.status_label.setText(f"Found {len(pdf_files)} PDF invoices.")
@@ -461,7 +475,7 @@ class SRVendorInvoicesDialog(QDialog):
     def filter_invoices(self) -> None:
         search_text = self.search_input.text().lower()
         for i in range(self.invoice_list.rowCount()):
-            item = self.invoice_list.item(i, 0)
+            item = self.invoice_list.item(i, 1) # Column 1 contains File Name and UserRole
             if item and item.data(Qt.UserRole):
                 self.invoice_list.setRowHidden(i, search_text not in item.text().lower())
 
@@ -471,7 +485,7 @@ class SRVendorInvoicesDialog(QDialog):
             return
             
         row = selected_ranges[0].topRow()
-        item = self.invoice_list.item(row, 0)
+        item = self.invoice_list.item(row, 1) # Column 1 contains File Name and UserRole
         if not item:
             return
             

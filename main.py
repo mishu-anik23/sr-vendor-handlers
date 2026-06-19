@@ -1,7 +1,7 @@
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import io
 
 import pandas as pd
@@ -615,6 +615,84 @@ class SRVendorInvoicesDialog(QDialog):
         self.excel_tabs.setCurrentIndex(3) # "Unique Products" tab is index 3
         self.status_label.setText(f"Computed {len(unique_rows)} total unique products in history.")
 
+    def get_meta_inv_details(self, meta: Dict[str, Any]) -> Tuple[str, str]:
+        date_val = ""
+        inv_val = ""
+        
+        # Common date keys
+        for k in ["invoice date", "datum", "date"]:
+            for actual_key in meta.keys():
+                if str(actual_key).lower() == k:
+                    date_val = str(meta[actual_key])
+                    break
+            if date_val:
+                break
+                
+        # Common invoice number keys
+        for k in ["invoice number", "rechn.nr.", "doc. nr.", "invoice_no", "invoice no"]:
+            for actual_key in meta.keys():
+                if str(actual_key).lower() == k:
+                    inv_val = str(meta[actual_key])
+                    break
+            if inv_val:
+                break
+                
+        return date_val, inv_val
+
+    def get_prior_history(self, df_archive: pd.DataFrame, current_date_str: str, current_inv_no: str) -> pd.DataFrame:
+        if df_archive.empty:
+            return df_archive
+            
+        df = df_archive.copy()
+        
+        # Find date column
+        date_col = None
+        for c in ["invoice date", "datum", "date"]:
+            for actual_col in df.columns:
+                if str(actual_col).lower() == c:
+                    date_col = actual_col
+                    break
+            if date_col:
+                break
+                
+        # Find invoice number column
+        inv_col = None
+        for c in ["invoice number", "rechn.nr.", "doc. nr.", "invoice_no", "invoice no"]:
+            for actual_col in df.columns:
+                if str(actual_col).lower() == c:
+                    inv_col = actual_col
+                    break
+            if inv_col:
+                break
+                
+        # Parse dates in archive
+        if date_col:
+            df["_parsed_date"] = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce")
+            # Sort chronologically
+            df = df.sort_values(by="_parsed_date", ascending=True)
+            
+        # Parse current date
+        current_date = pd.to_datetime(current_date_str, dayfirst=True, errors="coerce") if current_date_str else None
+        
+        # If invoice number is found in the archive, filter to keep all rows before its first occurrence
+        if inv_col and current_inv_no:
+            matching_indices = df[df[inv_col].astype(str) == str(current_inv_no)].index
+            if len(matching_indices) > 0:
+                # Get the position of the first matching row in the sorted DataFrame
+                sorted_indices = list(df.index)
+                first_match_pos = sorted_indices.index(matching_indices[0])
+                # Prior rows are all those before first_match_pos
+                prior_df = df.iloc[:first_match_pos]
+                return prior_df
+                
+        # Fallback: if invoice number is not in the archive, filter by date strictly less than current_date
+        if date_col and current_date is not None:
+            prior_df = df[df["_parsed_date"] < current_date]
+            return prior_df
+            
+        # Fallback 2: if date parsing fails or no dates, return empty DataFrame (assume everything is unique)
+        return pd.DataFrame(columns=df_archive.columns)
+
     def parse_selected_invoice(self) -> None:
         if not self.current_pdf_path:
             return
@@ -638,18 +716,24 @@ class SRVendorInvoicesDialog(QDialog):
             unique_current_rows = []
             
             if df_archive is not None and not df_archive.empty:
-                # Find product code column in current rows and archive df
+                # Find date & invoice number of current selected invoice from meta
+                curr_date_str, curr_inv_no = self.get_meta_inv_details(meta)
+                
+                # Retrieve history strictly prior to the current selected invoice
+                df_prior = self.get_prior_history(df_archive, curr_date_str, curr_inv_no)
+                
+                # Find product code column in current rows and prior archive df
                 id_col_current = None
                 if rows:
                     id_col_current = self.get_product_id_column(pd.DataFrame(rows[:1]))
                     
-                id_col_archive = self.get_product_id_column(df_archive)
+                id_col_archive = self.get_product_id_column(df_prior)
                 
-                if id_col_current and id_col_archive:
-                    archived_ids = set(str(pid).strip() for pid in df_archive[id_col_archive].dropna())
+                if id_col_current and id_col_archive and not df_prior.empty:
+                    prior_ids = set(str(pid).strip() for pid in df_prior[id_col_archive].dropna())
                     for r in rows:
                         pid = str(r.get(id_col_current)).strip()
-                        if pid not in archived_ids:
+                        if pid not in prior_ids:
                             unique_current_rows.append(r)
                 else:
                     unique_current_rows = rows

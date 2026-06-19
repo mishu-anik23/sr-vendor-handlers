@@ -356,6 +356,11 @@ class SRVendorInvoicesDialog(QDialog):
         self.table_archive.setStyleSheet("QHeaderView::section { background-color: #f2f2f2; font-weight: bold; }")
         self.excel_tabs.addTab(self.table_archive, "Purchase Archives")
 
+        # Sub tab 3.5: Invoices Summary Table
+        self.table_summary = QTableWidget()
+        self.table_summary.setStyleSheet("QHeaderView::section { background-color: #f2f2f2; font-weight: bold; }")
+        self.excel_tabs.addTab(self.table_summary, "Invoices Summary")
+
         # Sub tab 4: Unique Products Table
         self.table_unique = QTableWidget()
         self.table_unique.setStyleSheet("QHeaderView::section { background-color: #f2f2f2; font-weight: bold; }")
@@ -504,6 +509,7 @@ class SRVendorInvoicesDialog(QDialog):
         self.parsed_rows = None
         self.archive_rows = []
         self.unique_rows = []
+        self.summary_rows = []
         self.tabs.setTabEnabled(1, False)
         self.download_btn.setEnabled(False)
         self.tabs.setCurrentIndex(0)
@@ -597,6 +603,14 @@ class SRVendorInvoicesDialog(QDialog):
                 return col
         return df.columns[0] if len(df.columns) > 0 else None
 
+    def get_amount_column(self, df: pd.DataFrame) -> Optional[str]:
+        # Common amount column names
+        candidates = ["amount", "betrag eur", "net price", "price"]
+        for col in df.columns:
+            if str(col).lower() in candidates:
+                return col
+        return None
+
     def show_purchase_archives(self) -> None:
         if not self.selected_vendor:
             QMessageBox.warning(self, "No Vendor", "Please select a vendor first.")
@@ -650,18 +664,75 @@ class SRVendorInvoicesDialog(QDialog):
         self.populate_meta_table(self.table_meta, stats_meta)
         self.parsed_meta = stats_meta
         
-        # Setup tab visibility (Show Statistics and Purchase Archives only)
+        # Calculate summary statistics for each invoice chronologically
+        summary_rows = []
+        if inv_col:
+            df_chron = df.copy()
+            if date_col:
+                df_chron["_parsed_date"] = pd.to_datetime(df_chron[date_col], dayfirst=True, errors="coerce")
+                df_chron = df_chron.sort_values(by="_parsed_date", ascending=True)
+            
+            invoice_groups = {}
+            for _, r in df_chron.iterrows():
+                inv_no = str(r[inv_col]).strip()
+                inv_date = str(r[date_col]).strip() if date_col else "N/A"
+                key = (inv_no, inv_date)
+                if key not in invoice_groups:
+                    invoice_groups[key] = []
+                invoice_groups[key].append(r)
+                
+            seen_pids = set()
+            id_col = self.get_product_id_column(df_chron)
+            amount_col = self.get_amount_column(df_chron)
+            
+            for (inv_no, inv_date), group_rows in invoice_groups.items():
+                total_amt = 0.0
+                unique_count = 0
+                for r in group_rows:
+                    if amount_col:
+                        try:
+                            val = float(r[amount_col])
+                            if not pd.isna(val):
+                                total_amt += val
+                        except (ValueError, TypeError):
+                            pass
+                    if id_col:
+                        pid = str(r[id_col]).strip()
+                        if pid not in seen_pids:
+                            seen_pids.add(pid)
+                            unique_count += 1
+                            
+                summary_rows.append({
+                    "Invoice Number": inv_no,
+                    "Invoice Date": inv_date,
+                    "Total Amount": round(total_amt, 2),
+                    "Ordered Product Count": len(group_rows),
+                    "Unique Products Count": unique_count
+                })
+                
+            if date_col:
+                # Sort summary descending (latest invoice date first)
+                summary_rows.sort(
+                    key=lambda x: pd.to_datetime(x["Invoice Date"], dayfirst=True, errors="coerce") or pd.Timestamp.min,
+                    reverse=True
+                )
+                
+        self.summary_rows = summary_rows
+        self.populate_table(self.table_summary, self.summary_rows)
+        
+        # Setup tab visibility (Show Statistics, Purchase Archives, Invoices Summary only)
         self.excel_tabs.setTabVisible(0, False)
         self.excel_tabs.setTabVisible(1, True)
         self.excel_tabs.setTabVisible(2, True)
-        self.excel_tabs.setTabVisible(3, False)
+        self.excel_tabs.setTabVisible(3, True)
+        self.excel_tabs.setTabVisible(4, False)
         
         # Enable Excel view and switch to the archive tab
         self.tabs.setTabEnabled(1, True)
         self.tabs.setCurrentIndex(1)
         self.excel_tabs.setCurrentIndex(2) # "Purchase Archives" tab is index 2
         self.download_btn.setEnabled(True)
-        self.status_label.setText(f"Loaded {len(rows)} products from historical archive.")
+        self.status_label.setText(f"Loaded {len(rows)} products and summarized {len(summary_rows)} invoices.")
 
     def show_all_unique_products(self) -> None:
         if not self.selected_vendor:
@@ -732,17 +803,19 @@ class SRVendorInvoicesDialog(QDialog):
             
         self.populate_meta_table(self.table_meta, stats_meta)
         self.parsed_meta = stats_meta
+        self.summary_rows = []
         
         # Setup tab visibility (Show Statistics and Unique Products only)
         self.excel_tabs.setTabVisible(0, False)
         self.excel_tabs.setTabVisible(1, True)
         self.excel_tabs.setTabVisible(2, False)
-        self.excel_tabs.setTabVisible(3, True)
+        self.excel_tabs.setTabVisible(3, False)
+        self.excel_tabs.setTabVisible(4, True)
         
         # Switch tabs
         self.tabs.setTabEnabled(1, True)
         self.tabs.setCurrentIndex(1)
-        self.excel_tabs.setCurrentIndex(3) # "Unique Products" tab is index 3
+        self.excel_tabs.setCurrentIndex(4) # "Unique Products" tab is index 4
         self.download_btn.setEnabled(True)
         self.status_label.setText(f"Computed {len(unique_rows)} total unique products in history.")
 
@@ -877,17 +950,19 @@ class SRVendorInvoicesDialog(QDialog):
             self.parsed_rows = rows
             self.archive_rows = []
             self.unique_rows = unique_current_rows
+            self.summary_rows = []
             
             # Populate tables in Excel tab
             self.populate_table(self.table_items, self.parsed_rows)
             self.populate_meta_table(self.table_meta, self.parsed_meta)
             self.populate_table(self.table_unique, self.unique_rows)
             
-            # Setup tab visibility (Hide Purchase Archives for individual invoices)
+            # Setup tab visibility (Hide Purchase Archives and Invoices Summary for individual invoices)
             self.excel_tabs.setTabVisible(0, True)
             self.excel_tabs.setTabVisible(1, True)
             self.excel_tabs.setTabVisible(2, False)
-            self.excel_tabs.setTabVisible(3, True)
+            self.excel_tabs.setTabVisible(3, False)
+            self.excel_tabs.setTabVisible(4, True)
             
             # Enable Excel views
             self.tabs.setTabEnabled(1, True)
@@ -953,7 +1028,9 @@ class SRVendorInvoicesDialog(QDialog):
             has_data = True
         if self.excel_tabs.isTabVisible(2) and getattr(self, "archive_rows", None):
             has_data = True
-        if self.excel_tabs.isTabVisible(3) and getattr(self, "unique_rows", None):
+        if self.excel_tabs.isTabVisible(3) and getattr(self, "summary_rows", None):
+            has_data = True
+        if self.excel_tabs.isTabVisible(4) and getattr(self, "unique_rows", None):
             has_data = True
 
         if not has_data:
@@ -996,8 +1073,15 @@ class SRVendorInvoicesDialog(QDialog):
                             pd.DataFrame(archive_rows).to_excel(writer, sheet_name="Purchase Archives", index=False)
                             sheets_written.append("Purchase Archives")
                             
-                    # Sheet 4: Unique Products (Index 3)
+                    # Sheet 4: Invoices Summary (Index 3)
                     if self.excel_tabs.isTabVisible(3):
+                        summary_rows = getattr(self, "summary_rows", [])
+                        if summary_rows:
+                            pd.DataFrame(summary_rows).to_excel(writer, sheet_name="Invoices Summary", index=False)
+                            sheets_written.append("Invoices Summary")
+                            
+                    # Sheet 5: Unique Products (Index 4)
+                    if self.excel_tabs.isTabVisible(4):
                         unique_rows = getattr(self, "unique_rows", [])
                         if unique_rows:
                             pd.DataFrame(unique_rows).to_excel(writer, sheet_name="Unique Products", index=False)

@@ -1,4 +1,5 @@
 import sys
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -263,7 +264,11 @@ class SRVendorInvoicesDialog(QDialog):
         self.search_input.textChanged.connect(self.filter_invoices)
         left_layout.addWidget(self.search_input)
 
-        self.invoice_list = QListWidget()
+        self.invoice_list = QTableWidget(0, 2)
+        self.invoice_list.setHorizontalHeaderLabels(["Invoice File", "Invoice Date"])
+        self.invoice_list.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.invoice_list.setSelectionBehavior(QTableWidget.SelectRows)
+        self.invoice_list.setSelectionMode(QTableWidget.SingleSelection)
         self.invoice_list.itemSelectionChanged.connect(self.on_invoice_selected)
         left_layout.addWidget(self.invoice_list)
 
@@ -370,8 +375,47 @@ class SRVendorInvoicesDialog(QDialog):
         splitter.addWidget(right_widget)
         splitter.setSizes([280, 920]) # ~1/4 to 3/4 ratio
 
+    def extract_date_fast(self, pdf_path: Path, vendor_name: str) -> str:
+        vendor_lower = vendor_name.lower()
+        workspace_root = Path(r"c:\Users\mdtou\PycharmProjects\sr-vendor-handlers")
+        
+        # Build processed folder path
+        processed_dir = workspace_root / f"processed_{vendor_lower}"
+        if vendor_lower == "gft":
+            processed_dir = workspace_root / "processed"
+            
+        processed_excel = processed_dir / f"{pdf_path.stem}.xlsx"
+        
+        # 1. Try to read from processed Excel Statistics sheet
+        if processed_excel.exists():
+            try:
+                df_stat = pd.read_excel(processed_excel, sheet_name="Statistics")
+                if not df_stat.empty:
+                    for c in ["invoice date", "datum", "date"]:
+                        for col in df_stat.columns:
+                            if str(col).lower() == c:
+                                return str(df_stat.iloc[0][col])
+            except Exception:
+                pass
+                
+        # 2. Fallback: Parse the first page text of the PDF directly using pypdfium2 (very fast)
+        try:
+            doc = pdfium.PdfDocument(str(pdf_path))
+            if len(doc) > 0:
+                page = doc[0]
+                textpage = page.get_textpage()
+                text = textpage.get_text_bounded()
+                # Find date pattern (DD.MM.YYYY, DD-MM-YYYY, DD/MM/YYYY, etc.)
+                matches = re.findall(r"\b\d{1,2}[-./]\d{1,2}[-./]\d{2,4}\b", text)
+                if matches:
+                    return matches[0]
+        except Exception:
+            pass
+            
+        return "N/A"
+
     def load_invoices(self) -> None:
-        self.invoice_list.clear()
+        self.invoice_list.setRowCount(0)
         if not VENDOR_ROOT.exists():
             self.status_label.setText("Error: Vendor data directory not found.")
             return
@@ -385,32 +429,52 @@ class SRVendorInvoicesDialog(QDialog):
         if not pdf_files:
             msg = f"No PDF invoices found for vendor '{self.selected_vendor}'." if self.selected_vendor else "No PDF invoices found in vendor directories."
             self.status_label.setText(msg)
-            item = QListWidgetItem("No invoices found")
+            self.invoice_list.setRowCount(1)
+            item = QTableWidgetItem("No invoices found")
             item.setFlags(Qt.NoItemFlags)
-            self.invoice_list.addItem(item)
+            self.invoice_list.setItem(0, 0, item)
+            self.invoice_list.setItem(0, 1, QTableWidgetItem(""))
             return
 
-        for pdf_path in sorted(pdf_files, key=lambda p: (p.parent.parent.name, p.name)):
+        sorted_files = sorted(pdf_files, key=lambda p: (p.parent.parent.name, p.name))
+        self.invoice_list.setRowCount(len(sorted_files))
+        
+        for idx, pdf_path in enumerate(sorted_files):
             vendor_name = pdf_path.parent.parent.name.capitalize()
-            item = QListWidgetItem(f"[{vendor_name}] {pdf_path.name}")
-            item.setData(Qt.UserRole, str(pdf_path))
-            self.invoice_list.addItem(item)
+            file_display = f"[{vendor_name}] {pdf_path.name}"
+            
+            # Fast date extraction
+            invoice_date = self.extract_date_fast(pdf_path, vendor_name)
+            
+            item_file = QTableWidgetItem(file_display)
+            item_file.setData(Qt.UserRole, str(pdf_path))
+            
+            item_date = QTableWidgetItem(invoice_date)
+            item_date.setTextAlignment(Qt.AlignCenter)
+            
+            self.invoice_list.setItem(idx, 0, item_file)
+            self.invoice_list.setItem(idx, 1, item_date)
 
+        self.invoice_list.resizeColumnsToContents()
         self.status_label.setText(f"Found {len(pdf_files)} PDF invoices.")
 
     def filter_invoices(self) -> None:
         search_text = self.search_input.text().lower()
-        for i in range(self.invoice_list.count()):
-            item = self.invoice_list.item(i)
-            if item.data(Qt.UserRole):
-                item.setHidden(search_text not in item.text().lower())
+        for i in range(self.invoice_list.rowCount()):
+            item = self.invoice_list.item(i, 0)
+            if item and item.data(Qt.UserRole):
+                self.invoice_list.setRowHidden(i, search_text not in item.text().lower())
 
     def on_invoice_selected(self) -> None:
-        selected_items = self.invoice_list.selectedItems()
-        if not selected_items:
+        selected_ranges = self.invoice_list.selectedRanges()
+        if not selected_ranges:
             return
-
-        item = selected_items[0]
+            
+        row = selected_ranges[0].topRow()
+        item = self.invoice_list.item(row, 0)
+        if not item:
+            return
+            
         pdf_path_str = item.data(Qt.UserRole)
         if not pdf_path_str:
             return

@@ -7,7 +7,7 @@ import io
 import pandas as pd
 import requests
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QIcon, QPixmap
+from PyQt5.QtGui import QIcon, QPixmap, QImage
 from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
@@ -229,10 +229,11 @@ class SRProductsArchiveDialog(QDialog):
 
 class SRVendorInvoicesDialog(QDialog):
     """Dialog for listing, rendering, parsing, and downloading vendor PDF invoices"""
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, selected_vendor: Optional[str] = None):
         super().__init__(parent)
         self.setWindowTitle("Vendor Invoices Viewer")
         self.setMinimumSize(1200, 800)
+        self.selected_vendor = selected_vendor
         self.current_pdf_path = None
         self.parsed_meta = None
         self.parsed_rows = None
@@ -353,8 +354,14 @@ class SRVendorInvoicesDialog(QDialog):
             return
 
         pdf_files = list(VENDOR_ROOT.glob("*/invoices/*.pdf"))
+        
+        # Filter files if selected_vendor is specified
+        if self.selected_vendor:
+            pdf_files = [p for p in pdf_files if p.parent.parent.name.lower() == self.selected_vendor.lower()]
+
         if not pdf_files:
-            self.status_label.setText("No PDF invoices found in vendor directories.")
+            msg = f"No PDF invoices found for vendor '{self.selected_vendor}'." if self.selected_vendor else "No PDF invoices found in vendor directories."
+            self.status_label.setText(msg)
             item = QListWidgetItem("No invoices found")
             item.setFlags(Qt.NoItemFlags)
             self.invoice_list.addItem(item)
@@ -1823,7 +1830,10 @@ class VendorManagerApp(QMainWindow):
         dialog.exec_()
 
     def open_invoices_dialog(self) -> None:
-        dialog = SRVendorInvoicesDialog(parent=self)
+        if not self.current_vendor:
+            QMessageBox.warning(self, "No vendor selected", "Please select a vendor before opening vendor invoices.")
+            return
+        dialog = SRVendorInvoicesDialog(parent=self, selected_vendor=self.current_vendor)
         dialog.exec_()
 
     def _display_sku(self, product: dict) -> str:

@@ -1,14 +1,16 @@
 import socket
 import threading
 from datetime import datetime
-from flask import Flask, jsonify, request, render_template_string
+from flask import Flask, jsonify, request, render_template_string, send_file
 import pandas as pd
 import io
 import requests
+from product_parser import process_excel_dataframe
 
 app = Flask(__name__)
-_db = None
-_get_vendors = None
+_db = None  # Injected at runtime
+_get_vendors = None  # Injected at runtime
+_archive_data = {'raw_content': None, 'processed_sheets': {}}  # Store raw content and processed dataframes
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -123,7 +125,11 @@ HTML_TEMPLATE = """
                 <input type="text" id="dropbox-url" placeholder="https://www.dropbox.com/..." style="font-size: 14px;">
                 <small style="color: #666; margin-top: 5px; display: block;">Paste the Dropbox Excel file link here</small>
             </div>
-            <button class="btn-load" onclick="loadDropboxSheet()">Load Sheet</button>
+            <div style="display: flex; gap: 10px;">
+                <button class="btn-load" onclick="loadDropboxSheet()" style="flex: 1;">Load Sheet</button>
+                <button class="btn-load" onclick="processExcel()" id="process-btn" style="flex: 1; background: #28a745; display: none;">Process Excel</button>
+                <button class="btn-load" onclick="downloadProcessedExcel()" id="download-btn" style="flex: 1; background: #17a2b8; display: none;">Download Processed</button>
+            </div>
             <div id="archive-content" style="margin-top: 20px;"></div>
         </div>
     </div>
@@ -310,6 +316,8 @@ HTML_TEMPLATE = """
             document.getElementById('archive-modal').style.display = 'none';
             document.getElementById('archive-content').innerHTML = '';
             document.getElementById('dropbox-url').value = '';
+            document.getElementById('process-btn').style.display = 'none';
+            document.getElementById('download-btn').style.display = 'none';
         }
 
         async function loadDropboxSheet() {
@@ -321,6 +329,8 @@ HTML_TEMPLATE = """
 
             const archiveContent = document.getElementById('archive-content');
             archiveContent.innerHTML = '<div class="loading"><div class="spinner"></div><p>Loading...</p></div>';
+            document.getElementById('process-btn').style.display = 'none';
+            document.getElementById('download-btn').style.display = 'none';
 
             try {
                 const response = await fetch('/api/load-excel', {
@@ -336,6 +346,7 @@ HTML_TEMPLATE = """
 
                 const data = await response.json();
                 displaySheets(data.sheets);
+                document.getElementById('process-btn').style.display = 'block';
             } catch (e) {
                 archiveContent.innerHTML = `<div style="color: red; padding: 20px; background: #ffe0e0; border-radius: 5px;"><b>Error:</b> ${e.message}</div>`;
             }
@@ -422,6 +433,38 @@ HTML_TEMPLATE = """
             };
             return String(text).replace(/[&<>"']/g, m => map[m]);
         }
+
+        async function processExcel() {
+            const archiveContent = document.getElementById('archive-content');
+            archiveContent.innerHTML = '<div class="loading"><div class="spinner"></div><p>Processing...</p></div>';
+            document.getElementById('process-btn').disabled = true;
+
+            try {
+                const response = await fetch('/api/process-excel', { method: 'POST' });
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.error || 'Failed to process file');
+                }
+                const data = await response.json();
+                displaySheets(data.sheets); // Re-use displaySheets to show processed data
+                document.getElementById('download-btn').style.display = 'block';
+            } catch (e) {
+                archiveContent.innerHTML = `<div style="color: red; padding: 20px; background: #ffe0e0; border-radius: 5px;"><b>Error:</b> ${e.message}</div>`;
+                document.getElementById('download-btn').style.display = 'none';
+            } finally {
+                document.getElementById('process-btn').disabled = false;
+            }
+        }
+
+        function downloadProcessedExcel() {
+            // Create a temporary link to trigger the download
+            const link = document.createElement('a');
+            link.href = '/api/download-processed-excel';
+            link.setAttribute('download', 'processed_products.xlsx');
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
     </script>
 </body>
 </html>
@@ -458,6 +501,7 @@ def update_inventory(vendor, sku):
 
 @app.route('/api/load-excel', methods=['POST'])
 def load_excel():
+    global _archive_data
     try:
         data = request.json
         url = data.get('url', '').strip()
@@ -467,16 +511,20 @@ def load_excel():
         
         # Convert Dropbox sharing URL to direct download URL
         if 'dropbox.com' in url:
-            # Replace the end parameter from ?dl=0 to ?dl=1 for direct download
-            if '?dl=0' in url:
-                url = url.replace('?dl=0', '?dl=1')
-            elif '?dl=1' not in url:
-                url = url + '?dl=1'
+            url = url.replace('dl=0', 'dl=1')
+            if 'dl=1' not in url:
+                if '?' in url:
+                    url += '&dl=1'
+                else:
+                    url += '?dl=1'
         
         # Fetch the file
         headers = {'User-Agent': 'Mozilla/5.0'}
         response = requests.get(url, headers=headers, timeout=30)
         response.raise_for_status()
+        
+        # Store raw content for processing later
+        _archive_data = {'raw_content': response.content, 'processed_sheets': {}}
         
         # Parse Excel file
         excel_file = io.BytesIO(response.content)
@@ -495,6 +543,76 @@ def load_excel():
         return jsonify({"error": f"Failed to fetch file: {str(e)}"}), 400
     except Exception as e:
         return jsonify({"error": f"Failed to parse Excel file: {str(e)}"}), 400
+
+@app.route('/api/process-excel', methods=['POST'])
+def process_excel():
+    global _archive_data
+    if not _archive_data.get('raw_content'):
+        return jsonify({"error": "No file loaded. Please load a file first."}), 400
+
+    try:
+        excel_file = io.BytesIO(_archive_data['raw_content'])
+        xls = pd.ExcelFile(excel_file, engine='openpyxl')
+        
+        processed_sheets_df = {}
+        processed_sheets_json = {}
+
+        def find_item_column(columns):
+            """Find the most likely column containing item descriptions."""
+            for col in columns:
+                if col.lower() in ['item', 'name', 'product name', 'description']:
+                    return col
+            for col in columns:
+                if 'item' in col.lower() or 'name' in col.lower():
+                    return col
+            return None
+
+        for sheet_name in xls.sheet_names:
+            df = pd.read_excel(xls, sheet_name=sheet_name)
+            
+            item_col = find_item_column(df.columns)
+            
+            if item_col:
+                processed_df = process_excel_dataframe(df, item_column=item_col)
+            else:
+                # If no item column found, just use the original dataframe
+                processed_df = df
+            
+            processed_sheets_df[sheet_name] = processed_df
+            processed_sheets_json[sheet_name] = processed_df.where(pd.notna(processed_df), None).to_dict('records')
+        
+        _archive_data['processed_sheets'] = processed_sheets_df
+        
+        return jsonify({"sheets": processed_sheets_json})
+
+    except Exception as e:
+        return jsonify({"error": f"Failed to process Excel file: {str(e)}"}), 400
+
+@app.route('/api/download-processed-excel', methods=['GET'])
+def download_processed_excel():
+    global _archive_data
+    if not _archive_data.get('processed_sheets'):
+        return "No processed data available to download.", 404
+
+    try:
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            for sheet_name, df in _archive_data['processed_sheets'].items():
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+        
+        output.seek(0)
+        
+        return send_file(
+            output,
+            download_name='processed_products.xlsx',
+            as_attachment=True,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+    except Exception as e:
+        # Log the exception for debugging
+        print(f"Error creating download file: {e}")
+        return "Failed to create download file.", 500
+
 
 def start_web_server(db, get_vendors_callback):
     global _db, _get_vendors

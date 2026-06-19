@@ -609,14 +609,58 @@ class SRVendorInvoicesDialog(QDialog):
             
         # Convert df to rows list of dicts to use our helper
         rows = df.to_dict(orient="records")
+        self.archive_rows = rows
         
         # Populate table_archive
         self.populate_table(self.table_archive, rows)
+        
+        # Calculate stats for the archive
+        date_col = None
+        for c in ["invoice date", "datum", "date"]:
+            for actual_col in df.columns:
+                if str(actual_col).lower() == c:
+                    date_col = actual_col
+                    break
+            if date_col:
+                break
+        
+        stats_meta = {
+            "Total Archived Products": len(rows),
+        }
+        
+        inv_col = None
+        for c in ["invoice number", "rechn.nr.", "doc. nr.", "invoice_no", "invoice no"]:
+            for actual_col in df.columns:
+                if str(actual_col).lower() == c:
+                    inv_col = actual_col
+                    break
+            if inv_col:
+                break
+                
+        if inv_col:
+            stats_meta["Total Distinct Invoices"] = df[inv_col].nunique()
+            
+        if date_col and not df.empty:
+            df_sorted = df.copy()
+            df_sorted["_parsed_date"] = pd.to_datetime(df_sorted[date_col], dayfirst=True, errors="coerce")
+            df_sorted = df_sorted.sort_values(by="_parsed_date", ascending=True)
+            stats_meta["First Purchase Date"] = df_sorted[date_col].iloc[0]
+            stats_meta["Last Purchase Date"] = df_sorted[date_col].iloc[-1]
+            
+        self.populate_meta_table(self.table_meta, stats_meta)
+        self.parsed_meta = stats_meta
+        
+        # Setup tab visibility (Show Statistics and Purchase Archives only)
+        self.excel_tabs.setTabVisible(0, False)
+        self.excel_tabs.setTabVisible(1, True)
+        self.excel_tabs.setTabVisible(2, True)
+        self.excel_tabs.setTabVisible(3, False)
         
         # Enable Excel view and switch to the archive tab
         self.tabs.setTabEnabled(1, True)
         self.tabs.setCurrentIndex(1)
         self.excel_tabs.setCurrentIndex(2) # "Purchase Archives" tab is index 2
+        self.download_btn.setEnabled(True)
         self.status_label.setText(f"Loaded {len(rows)} products from historical archive.")
 
     def show_all_unique_products(self) -> None:
@@ -662,6 +706,7 @@ class SRVendorInvoicesDialog(QDialog):
 
         # Let's populate the unique table
         self.populate_table(self.table_unique, unique_rows)
+        self.unique_rows = unique_rows
         
         # Let's generate statistics
         stats_meta = {
@@ -686,11 +731,19 @@ class SRVendorInvoicesDialog(QDialog):
             stats_meta["Last Purchase Date"] = df[date_col].iloc[-1]
             
         self.populate_meta_table(self.table_meta, stats_meta)
+        self.parsed_meta = stats_meta
+        
+        # Setup tab visibility (Show Statistics and Unique Products only)
+        self.excel_tabs.setTabVisible(0, False)
+        self.excel_tabs.setTabVisible(1, True)
+        self.excel_tabs.setTabVisible(2, False)
+        self.excel_tabs.setTabVisible(3, True)
         
         # Switch tabs
         self.tabs.setTabEnabled(1, True)
         self.tabs.setCurrentIndex(1)
         self.excel_tabs.setCurrentIndex(3) # "Unique Products" tab is index 3
+        self.download_btn.setEnabled(True)
         self.status_label.setText(f"Computed {len(unique_rows)} total unique products in history.")
 
     def get_meta_inv_details(self, meta: Dict[str, Any]) -> Tuple[str, str]:
@@ -790,7 +843,6 @@ class SRVendorInvoicesDialog(QDialog):
             # Load historical merged data
             df_archive = self.load_merged_history()
             
-            archive_rows = []
             unique_current_rows = []
             
             if df_archive is not None and not df_archive.empty:
@@ -815,23 +867,27 @@ class SRVendorInvoicesDialog(QDialog):
                             unique_current_rows.append(r)
                 else:
                     unique_current_rows = rows
-                    
-                archive_rows = df_archive.to_dict(orient="records")
             else:
                 unique_current_rows = rows
                 
+            meta["Total Ordered Product Count"] = len(rows)
             meta["Unique Products Count"] = len(unique_current_rows)
             
             self.parsed_meta = meta
             self.parsed_rows = rows
-            self.archive_rows = archive_rows
+            self.archive_rows = []
             self.unique_rows = unique_current_rows
             
             # Populate tables in Excel tab
             self.populate_table(self.table_items, self.parsed_rows)
             self.populate_meta_table(self.table_meta, self.parsed_meta)
-            self.populate_table(self.table_archive, self.archive_rows)
             self.populate_table(self.table_unique, self.unique_rows)
+            
+            # Setup tab visibility (Hide Purchase Archives for individual invoices)
+            self.excel_tabs.setTabVisible(0, True)
+            self.excel_tabs.setTabVisible(1, True)
+            self.excel_tabs.setTabVisible(2, False)
+            self.excel_tabs.setTabVisible(3, True)
             
             # Enable Excel views
             self.tabs.setTabEnabled(1, True)
@@ -889,41 +945,67 @@ class SRVendorInvoicesDialog(QDialog):
         table.resizeColumnsToContents()
 
     def download_excel(self) -> None:
-        if not self.current_pdf_path or not self.parsed_meta or not self.parsed_rows:
+        # Check if we have visible data to download
+        has_data = False
+        if self.excel_tabs.isTabVisible(0) and getattr(self, "parsed_rows", None):
+            has_data = True
+        if self.excel_tabs.isTabVisible(1) and getattr(self, "parsed_meta", None):
+            has_data = True
+        if self.excel_tabs.isTabVisible(2) and getattr(self, "archive_rows", None):
+            has_data = True
+        if self.excel_tabs.isTabVisible(3) and getattr(self, "unique_rows", None):
+            has_data = True
+
+        if not has_data:
+            QMessageBox.warning(self, "No Data", "There is no visible data to export.")
             return
 
-        default_name = f"{self.current_pdf_path.stem}_parsed.xlsx"
+        if self.current_pdf_path:
+            default_name = f"{self.current_pdf_path.stem}_parsed.xlsx"
+        elif self.selected_vendor:
+            if self.excel_tabs.isTabVisible(2):
+                default_name = f"{self.selected_vendor.lower()}_purchase_archives.xlsx"
+            else:
+                default_name = f"{self.selected_vendor.lower()}_unique_products.xlsx"
+        else:
+            default_name = "export.xlsx"
+
         options = QFileDialog.Options()
         file_name, _ = QFileDialog.getSaveFileName(self, "Save Parsed Excel", default_name, "Excel Files (*.xlsx)", options=options)
         if file_name:
             self.status_label.setText(f"Saving Excel to {file_name}...")
             QApplication.setOverrideCursor(Qt.WaitCursor)
             try:
-                # Write custom exporter with all 4 sheets
+                sheets_written = []
                 with pd.ExcelWriter(file_name, engine='openpyxl') as writer:
-                    # Sheet 1: Invoice Data
-                    pd.DataFrame(self.parsed_rows).to_excel(writer, sheet_name="Invoice Data", index=False)
-                    
-                    # Sheet 2: Statistics
-                    meta_df = pd.DataFrame(list(self.parsed_meta.items()), columns=["Field", "Value"])
-                    meta_df.to_excel(writer, sheet_name="Statistics", index=False)
-                    
-                    # Sheet 3: Purchase Archives
-                    archive_rows = getattr(self, "archive_rows", [])
-                    if archive_rows:
-                        pd.DataFrame(archive_rows).to_excel(writer, sheet_name="Purchase Archives", index=False)
-                    else:
-                        pd.DataFrame().to_excel(writer, sheet_name="Purchase Archives", index=False)
+                    # Sheet 1: Invoice Data (Index 0)
+                    if self.excel_tabs.isTabVisible(0) and getattr(self, "parsed_rows", None):
+                        pd.DataFrame(self.parsed_rows).to_excel(writer, sheet_name="Invoice Data", index=False)
+                        sheets_written.append("Invoice Data")
                         
-                    # Sheet 4: Unique Products
-                    unique_rows = getattr(self, "unique_rows", [])
-                    if unique_rows:
-                        pd.DataFrame(unique_rows).to_excel(writer, sheet_name="Unique Products", index=False)
-                    else:
-                        pd.DataFrame().to_excel(writer, sheet_name="Unique Products", index=False)
+                    # Sheet 2: Statistics (Index 1)
+                    if self.excel_tabs.isTabVisible(1) and getattr(self, "parsed_meta", None):
+                        meta_df = pd.DataFrame(list(self.parsed_meta.items()), columns=["Field", "Value"])
+                        meta_df.to_excel(writer, sheet_name="Statistics", index=False)
+                        sheets_written.append("Statistics")
                         
+                    # Sheet 3: Purchase Archives (Index 2)
+                    if self.excel_tabs.isTabVisible(2):
+                        archive_rows = getattr(self, "archive_rows", [])
+                        if archive_rows:
+                            pd.DataFrame(archive_rows).to_excel(writer, sheet_name="Purchase Archives", index=False)
+                            sheets_written.append("Purchase Archives")
+                            
+                    # Sheet 4: Unique Products (Index 3)
+                    if self.excel_tabs.isTabVisible(3):
+                        unique_rows = getattr(self, "unique_rows", [])
+                        if unique_rows:
+                            pd.DataFrame(unique_rows).to_excel(writer, sheet_name="Unique Products", index=False)
+                            sheets_written.append("Unique Products")
+                            
                 self.status_label.setText(f"Excel saved to {file_name}")
-                QMessageBox.information(self, "Success", f"Invoice successfully parsed and Excel saved with 4 sheets to:\n{file_name}")
+                sheets_str = ", ".join(sheets_written)
+                QMessageBox.information(self, "Success", f"Invoice successfully parsed and Excel saved with sheets: {sheets_str} to:\n{file_name}")
             except Exception as e:
                 self.status_label.setText(f"Failed to save Excel: {str(e)}")
                 QMessageBox.critical(self, "Error", f"Failed to save Excel file:\n{str(e)}")

@@ -131,6 +131,11 @@ class TestApplyStandards(unittest.TestCase):
         # Check Barcode caching (Row 2 and Row 3 are Cherry Pie, both should have barcode '333333')
         self.assertEqual(df_processed.at[2, 'Barcode'], '333333')
         self.assertEqual(df_processed.at[3, 'Barcode'], '333333')
+        
+        # Assert master sheets_data was preserved and not overwritten
+        self.assertIn('All', dialog.sheets_data)
+        self.assertIn('product', dialog.sheets_data)
+        self.assertNotIn('purchase archives', dialog.sheets_data)
 
     def test_apply_standards_logic_unique(self):
         dialog = SRProductsArchiveDialog(parent=None)
@@ -169,6 +174,67 @@ class TestApplyStandards(unittest.TestCase):
         # Cherry Pie (INV-3) -> 'asian2' (since it was the first occurrence)
         self.assertEqual(df_processed.at[2, 'Name'], 'Red Cherry Pie Unique')
         self.assertEqual(df_processed.at[2, 'Vendor'], 'asian2')
+        
+        # Assert master sheets_data was preserved and not overwritten
+        self.assertIn('All', dialog.sheets_data)
+        self.assertIn('product', dialog.sheets_data)
+        self.assertNotIn('purchase archives', dialog.sheets_data)
+
+    def test_apply_standards_multiple_runs_preserves_master_data(self):
+        dialog = SRProductsArchiveDialog(parent=None)
+        dialog.selected_vendor_name = "asiaexpress"
+        
+        # Simulate loading the sheets_data
+        dialog.sheets_data = {
+            'All': self.df_all_data,
+            'product': self.df_product_data
+        }
+        dialog.raw_excel_content = b"fake excel content bytes"
+        dialog.selected_file_path = str(self.merge_excel_path)
+        dialog.selected_file_type = "merge"
+        
+        # Run first time
+        dialog.apply_sunrise_standard()
+        self.assertIn('All', dialog.sheets_data)
+        
+        # Change selection and run second time to verify it doesn't raise error
+        dialog.selected_file_type = "unique"
+        dialog.apply_sunrise_standard()
+        
+        # Verify both runs succeeded and master sheets_data is still intact
+        self.assertIn('All', dialog.sheets_data)
+        self.assertIn('product', dialog.sheets_data)
+
+    def test_auto_load_default_session(self):
+        import shutil
+        # Create a mock cache dir path
+        mock_cache_dir = self.tmp_dir / "mock_cache"
+        mock_cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save a test excel as default_session.xlsx
+        shutil.copy(self.loaded_excel_path, mock_cache_dir / "default_session.xlsx")
+        
+        # Save a test url as last_url.txt
+        test_url = "https://www.dropbox.com/s/mocklink/sheet.xlsx?dl=1"
+        (mock_cache_dir / "last_url.txt").write_text(test_url, encoding='utf-8')
+        
+        # Instantiate dialog and point its cache_dir to mock_cache_dir
+        dialog = SRProductsArchiveDialog(parent=None)
+        dialog.cache_dir = mock_cache_dir
+        dialog.url_input.clear()
+        dialog.sheets_data = {}
+        
+        # Manually load the URL input text simulating the __init__ hook with mock_cache_dir
+        last_url_path = mock_cache_dir / "last_url.txt"
+        if last_url_path.exists():
+            dialog.url_input.setText(last_url_path.read_text(encoding='utf-8').strip())
+            
+        dialog.auto_load_default_session()
+        
+        # Assertions
+        self.assertEqual(dialog.url_input.text(), test_url)
+        self.assertIn('All', dialog.sheets_data)
+        self.assertIn('product', dialog.sheets_data)
 
 if __name__ == "__main__":
     unittest.main()

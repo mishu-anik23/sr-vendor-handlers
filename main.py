@@ -66,6 +66,17 @@ class SRProductsArchiveDialog(QDialog):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.force_fresh_fetch = False
         self._build_ui()
+        
+        # Load last URL if present
+        last_url_path = self.cache_dir / "last_url.txt"
+        if last_url_path.exists():
+            try:
+                self.url_input.setText(last_url_path.read_text(encoding='utf-8').strip())
+            except Exception as e:
+                print(f"Error loading last URL: {e}")
+                
+        # Auto-load default session if present
+        self.auto_load_default_session()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -202,6 +213,34 @@ class SRProductsArchiveDialog(QDialog):
             self.showFullScreen()
             self.fullscreen_btn.setText("Normal Screen")
 
+    def auto_load_default_session(self) -> None:
+        default_file = self.cache_dir / "default_session.xlsx"
+        if default_file.exists():
+            try:
+                self.status_label.setText("Auto-loading default session...")
+                with open(default_file, "rb") as f:
+                    excel_bytes = f.read()
+                
+                self.raw_excel_content = excel_bytes
+                excel_file = io.BytesIO(excel_bytes)
+                xls = pd.ExcelFile(excel_file, engine='openpyxl')
+                
+                self.sheets_data = {}
+                for sheet_name in xls.sheet_names:
+                    df = pd.read_excel(excel_file, sheet_name=sheet_name, engine='openpyxl')
+                    self.sheets_data[sheet_name] = df
+                
+                self._display_sheets()
+                self.load_vendors()
+                self.status_label.setText("Successfully loaded default session.")
+                
+                self.main_splitter.setVisible(True)
+                self.main_splitter.setSizes([350, 350])
+                self.download_btn.setVisible(False)
+                self.save_version_btn.setVisible(True)
+            except Exception as e:
+                self.status_label.setText(f"Error auto-loading default session: {e}")
+
     def load_vendors(self) -> None:
         self.vendor_list.clear()
         if VENDOR_ROOT.exists():
@@ -321,6 +360,12 @@ class SRProductsArchiveDialog(QDialog):
             try:
                 with open(version_file_path, "wb") as f:
                     f.write(self.raw_excel_content)
+                # Also save to default_session.xlsx
+                try:
+                    with open(self.cache_dir / "default_session.xlsx", "wb") as f:
+                        f.write(self.raw_excel_content)
+                except Exception as ex:
+                    print(f"Error updating default_session.xlsx: {ex}")
                 QMessageBox.information(self, "Success", f"Session saved successfully as version '{version_name_clean}'.")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to save version:\n{str(e)}")
@@ -358,6 +403,16 @@ class SRProductsArchiveDialog(QDialog):
                 
                 self._display_sheets()
                 self.load_vendors()
+                
+                # Save as default session
+                try:
+                    with open(self.cache_dir / "default_session.xlsx", "wb") as f:
+                        f.write(excel_bytes)
+                    last_url_path = self.cache_dir / "last_url.txt"
+                    if last_url_path.exists():
+                        last_url_path.unlink()
+                except Exception as ex:
+                    print(f"Error saving default session: {ex}")
                 
                 self.status_label.setText(f"Successfully loaded version '{item}' from local storage")
                 
@@ -445,6 +500,15 @@ class SRProductsArchiveDialog(QDialog):
             self._display_sheets()
             self.load_vendors()
             
+            # Save as default session and save URL
+            try:
+                with open(self.cache_dir / "default_session.xlsx", "wb") as f:
+                    f.write(excel_bytes)
+                with open(self.cache_dir / "last_url.txt", "w", encoding='utf-8') as f:
+                    f.write(url)
+            except Exception as ex:
+                print(f"Error saving default session or URL: {ex}")
+            
             if loaded_from_cache:
                 self.status_label.setText(f"Successfully loaded {len(self.sheets_data)} sheet(s) from Cache (Materialized View)")
             else:
@@ -460,10 +524,11 @@ class SRProductsArchiveDialog(QDialog):
             self.status_label.setText(f"Error: Failed to parse file - {str(e)}")
             QMessageBox.critical(self, "Error", f"Failed to parse Excel file:\n{str(e)}")
 
-    def _display_sheets(self) -> None:
+    def _display_sheets(self, data_dict=None) -> None:
         self.tab_widget.clear()
         
-        for sheet_name, df in self.sheets_data.items():
+        display_data = data_dict if data_dict is not None else self.sheets_data
+        for sheet_name, df in display_data.items():
             # Create table for this sheet
             table = QTableWidget()
             table.setColumnCount(len(df.columns))
@@ -803,8 +868,7 @@ class SRProductsArchiveDialog(QDialog):
                 'purchase archives': df_original_merge,
                 'SR standard Archives': df_merge_processed
             }
-            self.sheets_data = self.processed_sheets
-            self._display_sheets()
+            self._display_sheets(self.processed_sheets)
             
             # Switch to the processed sheet tab (index 1)
             self.tab_widget.setCurrentIndex(1)

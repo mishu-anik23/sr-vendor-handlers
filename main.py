@@ -31,7 +31,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget, QHBoxLayout, QSpinBox, QScrollArea,
     QFileDialog,
-    QRadioButton, QButtonGroup,
+    QRadioButton, QButtonGroup, QInputDialog,
 )
 
 from db_manager import DatabaseManager
@@ -85,6 +85,17 @@ class SRProductsArchiveDialog(QDialog):
         self.fetch_new_btn.setStyleSheet("background-color: #ffc107; color: black; font-weight: bold;")
         self.fetch_new_btn.clicked.connect(self.fetch_new_data)
         url_layout.addWidget(self.fetch_new_btn)
+
+        self.load_versioned_btn = QPushButton("Load Versioned")
+        self.load_versioned_btn.setStyleSheet("background-color: #6f42c1; color: white; font-weight: bold;")
+        self.load_versioned_btn.clicked.connect(self.load_versioned_session)
+        url_layout.addWidget(self.load_versioned_btn)
+
+        self.save_version_btn = QPushButton("Save Session Version")
+        self.save_version_btn.setStyleSheet("background-color: #17a2b8; color: white; font-weight: bold;")
+        self.save_version_btn.clicked.connect(self.save_session_version)
+        self.save_version_btn.setVisible(False)
+        url_layout.addWidget(self.save_version_btn)
 
         self.fullscreen_btn = QPushButton("Fullscreen")
         self.fullscreen_btn.setStyleSheet("background-color: #6c757d; color: white;")
@@ -277,6 +288,89 @@ class SRProductsArchiveDialog(QDialog):
         self.force_fresh_fetch = True
         self.load_sheet()
 
+    def save_session_version(self) -> None:
+        if not self.raw_excel_content:
+            QMessageBox.warning(self, "Error", "No loaded Excel content to save.")
+            return
+            
+        text, ok = QInputDialog.getText(self, "Save Loaded Session Version", "Enter version name for this loaded spreadsheet:")
+        if ok and text:
+            version_name = text.strip()
+            # Clean version name to be a safe filename
+            import re
+            version_name_clean = re.sub(r'[^a-zA-Z0-9_\-]', '_', version_name)
+            if not version_name_clean:
+                QMessageBox.warning(self, "Error", "Invalid version name.")
+                return
+                
+            versions_dir = self.cache_dir / "versions"
+            versions_dir.mkdir(parents=True, exist_ok=True)
+            version_file_path = versions_dir / f"{version_name_clean}.xlsx"
+            
+            # If exists, ask for overwrite confirmation
+            if version_file_path.exists():
+                reply = QMessageBox.question(
+                    self, 
+                    "Overwrite Version", 
+                    f"A version named '{version_name_clean}' already exists. Overwrite it?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if reply == QMessageBox.No:
+                    return
+                    
+            try:
+                with open(version_file_path, "wb") as f:
+                    f.write(self.raw_excel_content)
+                QMessageBox.information(self, "Success", f"Session saved successfully as version '{version_name_clean}'.")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to save version:\n{str(e)}")
+
+    def load_versioned_session(self) -> None:
+        versions_dir = self.cache_dir / "versions"
+        if not versions_dir.exists() or not list(versions_dir.glob("*.xlsx")):
+            QMessageBox.information(self, "No Versions Found", "No saved session versions found on disk.")
+            return
+            
+        # Get list of versions
+        version_files = sorted(list(versions_dir.glob("*.xlsx")))
+        versions_list = [f.stem for f in version_files]
+        
+        item, ok = QInputDialog.getItem(self, "Load Versioned Session", "Select a saved version to load:", versions_list, 0, False)
+        if ok and item:
+            selected_file = versions_dir / f"{item}.xlsx"
+            try:
+                self.status_label.setText(f"Loading version '{item}'...")
+                self.main_splitter.setVisible(False)
+                
+                with open(selected_file, "rb") as f:
+                    excel_bytes = f.read()
+                    
+                self.raw_excel_content = excel_bytes
+                
+                # Parse Excel
+                excel_file = io.BytesIO(excel_bytes)
+                xls = pd.ExcelFile(excel_file, engine='openpyxl')
+                
+                self.sheets_data = {}
+                for sheet_name in xls.sheet_names:
+                    df = pd.read_excel(excel_file, sheet_name=sheet_name, engine='openpyxl')
+                    self.sheets_data[sheet_name] = df
+                
+                self._display_sheets()
+                self.load_vendors()
+                
+                self.status_label.setText(f"Successfully loaded version '{item}' from local storage")
+                
+                # Show layout
+                self.main_splitter.setVisible(True)
+                self.main_splitter.setSizes([350, 350])
+                self.download_btn.setVisible(False)
+                self.save_version_btn.setVisible(True)
+                
+            except Exception as e:
+                self.status_label.setText(f"Error loading version: {str(e)}")
+                QMessageBox.critical(self, "Error", f"Failed to load version '{item}':\n{str(e)}")
+
     def load_sheet(self) -> None:
         url = self.url_input.text().strip()
         if not url:
@@ -360,6 +454,7 @@ class SRProductsArchiveDialog(QDialog):
             self.main_splitter.setVisible(True)
             self.main_splitter.setSizes([350, 350])
             self.download_btn.setVisible(False)
+            self.save_version_btn.setVisible(True)
             
         except Exception as e:
             self.status_label.setText(f"Error: Failed to parse file - {str(e)}")

@@ -69,7 +69,7 @@ class EurFrozenInvoiceParser(BaseInvoiceParser):
         eurfrozen.write_excel(meta, rows, str(out_path))
 
 
-class CKInvoiceParser(BaseInvoiceParser):
+class CKInvoiceParser(BaseInvoiceParser):    
     def parse(self, pdf_path: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         import pdf_invoice_to_excel_ck as ck
         return ck.parse_pdf(str(pdf_path))
@@ -77,6 +77,16 @@ class CKInvoiceParser(BaseInvoiceParser):
     def write_excel(self, meta: Dict[str, Any], rows: List[Dict[str, Any]], out_path: Path) -> None:
         import pdf_invoice_to_excel_ck as ck
         ck.write_excel(meta, rows, str(out_path))
+
+
+class TransfoodInvoiceParser(BaseInvoiceParser):
+    def parse(self, pdf_path: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        import pdf_invoice_to_excel_transfood as transfood
+        return transfood.parse_pdf(str(pdf_path))
+        
+    def write_excel(self, meta: Dict[str, Any], rows: List[Dict[str, Any]], out_path: Path) -> None:
+        import pdf_invoice_to_excel_transfood as transfood
+        transfood.write_excel(meta, rows, str(out_path))
 
 
 # Registry mapping vendor directory names to parser instances
@@ -87,6 +97,7 @@ PARSERS: Dict[str, BaseInvoiceParser] = {
     "ift": IFTInvoiceParser(),
     "eurfrozen": EurFrozenInvoiceParser(),
     "ck": CKInvoiceParser(),
+    "transfood": TransfoodInvoiceParser(),
 }
 
 def get_parser(vendor_name: str) -> BaseInvoiceParser:

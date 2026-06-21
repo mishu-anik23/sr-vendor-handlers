@@ -31,6 +31,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget, QHBoxLayout, QSpinBox, QScrollArea,
     QFileDialog,
+    QRadioButton, QButtonGroup,
 )
 
 from db_manager import DatabaseManager
@@ -53,10 +54,14 @@ class SRProductsArchiveDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("SR Products Archive")
-        self.setMinimumSize(1200, 700)
+        self.setMinimumSize(1200, 750)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMinMaxButtonsHint)
         self.sheets_data = {}
         self.raw_excel_content = None
         self.processed_sheets = {}
+        self.selected_file_path = None
+        self.selected_file_type = None
+        self.selected_vendor_name = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -73,11 +78,10 @@ class SRProductsArchiveDialog(QDialog):
         load_btn.clicked.connect(self.load_sheet)
         url_layout.addWidget(load_btn)
 
-        self.process_btn = QPushButton("Process Excel")
-        self.process_btn.setStyleSheet("background-color: #28a745; color: white;")
-        self.process_btn.clicked.connect(self.process_excel)
-        self.process_btn.setVisible(False)
-        url_layout.addWidget(self.process_btn)
+        self.fullscreen_btn = QPushButton("Fullscreen")
+        self.fullscreen_btn.setStyleSheet("background-color: #6c757d; color: white;")
+        self.fullscreen_btn.clicked.connect(self.toggle_fullscreen)
+        url_layout.addWidget(self.fullscreen_btn)
 
         self.download_btn = QPushButton("Download Processed")
         self.download_btn.setStyleSheet("background-color: #17a2b8; color: white;")
@@ -86,15 +90,180 @@ class SRProductsArchiveDialog(QDialog):
         url_layout.addWidget(self.download_btn)
 
         layout.addLayout(url_layout)
+
+        # Main splitter (vertical)
+        self.main_splitter = QSplitter(Qt.Vertical)
+        self.main_splitter.setVisible(False)
+        layout.addWidget(self.main_splitter)
         
-        # Tab widget for sheets
+        # Tab widget for sheets (upper half)
         self.tab_widget = QTabWidget()
-        self.tab_widget.setVisible(False)
-        layout.addWidget(self.tab_widget)
+        self.main_splitter.addWidget(self.tab_widget)
+        
+        # Bottom panel (lower half)
+        self.bottom_panel = QWidget()
+        bottom_layout = QHBoxLayout(self.bottom_panel)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        self.main_splitter.addWidget(self.bottom_panel)
+
+        # Splitter for bottom panel (left 1/4, right 3/4)
+        self.bottom_splitter = QSplitter(Qt.Horizontal)
+        bottom_layout.addWidget(self.bottom_splitter)
+
+        # Left 1/4 widget (Vendors and files list)
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 5, 0)
+
+        left_layout.addWidget(QLabel("<b>Available Vendors:</b>"))
+        self.vendor_list = QListWidget()
+        self.vendor_list.itemSelectionChanged.connect(self.on_vendor_selected)
+        left_layout.addWidget(self.vendor_list)
+
+        left_layout.addWidget(QLabel("<b>Vendor Files:</b>"))
+        self.vendor_files_list = QListWidget()
+        self.vendor_files_list.itemSelectionChanged.connect(self.on_file_selected)
+        left_layout.addWidget(self.vendor_files_list)
+
+        self.bottom_splitter.addWidget(left_widget)
+
+        # Right 3/4 widget (Standardization Control Panel)
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(5, 0, 0, 0)
+
+        right_layout.addWidget(QLabel("<b>Standardization Control Panel</b>"))
+        
+        info_group = QGroupBox("Selection Details")
+        info_layout = QVBoxLayout(info_group)
+        self.info_vendor_label = QLabel("Selected Vendor: None")
+        self.info_file_label = QLabel("Selected File: None")
+        self.info_type_label = QLabel("File Type: None")
+        info_layout.addWidget(self.info_vendor_label)
+        info_layout.addWidget(self.info_file_label)
+        info_layout.addWidget(self.info_type_label)
+        right_layout.addWidget(info_group)
+
+        # Mode Selection
+        mode_group = QGroupBox("Selected File Mode Option")
+        mode_layout = QHBoxLayout(mode_group)
+        self.radio_merge = QRadioButton("Merge File")
+        self.radio_unique = QRadioButton("Unique File")
+        self.radio_merge.setEnabled(False)
+        self.radio_unique.setEnabled(False)
+        mode_layout.addWidget(self.radio_merge)
+        mode_layout.addWidget(self.radio_unique)
+        right_layout.addWidget(mode_group)
+
+        # Button layout
+        right_layout.addStretch()
+        self.apply_standards_btn = QPushButton("Apply Standards")
+        self.apply_standards_btn.setEnabled(False)
+        self.apply_standards_btn.setStyleSheet(
+            "background-color: #28a745; color: white; font-size: 13pt; font-weight: bold; padding: 12px; border-radius: 5px;"
+        )
+        self.apply_standards_btn.clicked.connect(self.apply_standards)
+        right_layout.addWidget(self.apply_standards_btn)
+
+        self.bottom_splitter.addWidget(right_widget)
+
+        # Set stretch factors for bottom splitter: left 1, right 3 (1/4 and 3/4)
+        self.bottom_splitter.setStretchFactor(0, 1)
+        self.bottom_splitter.setStretchFactor(1, 3)
         
         # Status/message label
         self.status_label = QLabel("Enter a Dropbox URL and click 'Load Sheet'")
         layout.addWidget(self.status_label)
+
+    def toggle_fullscreen(self) -> None:
+        if self.isFullScreen():
+            self.showNormal()
+            self.fullscreen_btn.setText("Fullscreen")
+        else:
+            self.showFullScreen()
+            self.fullscreen_btn.setText("Normal Screen")
+
+    def load_vendors(self) -> None:
+        self.vendor_list.clear()
+        if VENDOR_ROOT.exists():
+            vendor_names = [p.name for p in VENDOR_ROOT.iterdir() if p.is_dir()]
+            vendor_names.sort()
+            for vendor in vendor_names:
+                self.vendor_list.addItem(vendor)
+
+    def on_vendor_selected(self) -> None:
+        selected_items = self.vendor_list.selectedItems()
+        if not selected_items:
+            self.vendor_files_list.clear()
+            self.info_vendor_label.setText("Selected Vendor: None")
+            return
+            
+        vendor_name = selected_items[0].text()
+        self.selected_vendor_name = vendor_name
+        self.info_vendor_label.setText(f"Selected Vendor: {vendor_name}")
+        
+        self.vendor_files_list.clear()
+        
+        # Determine vendor specific files
+        vendor_lower = vendor_name.lower()
+        workspace_root = Path(r"c:\Users\mdtou\PycharmProjects\sr-vendor-handlers")
+        
+        merged_path = workspace_root / f"merged_{vendor_lower}.xlsx"
+        if not merged_path.exists():
+            merged_path = workspace_root / "merged.xlsx"
+            
+        unique_path = workspace_root / f"unique_{vendor_lower}.xlsx"
+        if not unique_path.exists():
+            unique_path = workspace_root / f"processed_{vendor_lower}.xlsx"
+        if not unique_path.exists():
+            unique_path = workspace_root / "processed_products.xlsx"
+            
+        # Add items to the files list if they exist, or display with a warning
+        merged_item = QListWidgetItem(f"Merged Purchased Archives ({merged_path.name})")
+        merged_item.setData(Qt.UserRole, str(merged_path))
+        merged_item.setData(Qt.UserRole + 1, "merge")
+        if not merged_path.exists():
+            merged_item.setText(f"Merged Purchased Archives (Not Found)")
+            merged_item.setFlags(merged_item.flags() & ~Qt.ItemIsEnabled)
+        self.vendor_files_list.addItem(merged_item)
+        
+        unique_item = QListWidgetItem(f"Unique Products ({unique_path.name})")
+        unique_item.setData(Qt.UserRole, str(unique_path))
+        unique_item.setData(Qt.UserRole + 1, "unique")
+        if not unique_path.exists():
+            unique_item.setText(f"Unique Products (Not Found)")
+            unique_item.setFlags(unique_item.flags() & ~Qt.ItemIsEnabled)
+        self.vendor_files_list.addItem(unique_item)
+
+    def on_file_selected(self) -> None:
+        selected_items = self.vendor_files_list.selectedItems()
+        if not selected_items:
+            self.apply_standards_btn.setEnabled(False)
+            self.info_file_label.setText("Selected File: None")
+            self.info_type_label.setText("File Type: None")
+            self.radio_merge.setChecked(False)
+            self.radio_unique.setChecked(False)
+            return
+            
+        item = selected_items[0]
+        file_path = item.data(Qt.UserRole)
+        file_type = item.data(Qt.UserRole + 1)
+        
+        self.selected_file_path = file_path
+        self.selected_file_type = file_type
+        
+        self.info_file_label.setText(f"Selected File: {Path(file_path).name}")
+        self.info_type_label.setText(f"File Type: {file_type.capitalize()}")
+        
+        # Check radio button
+        self.radio_merge.setEnabled(True)
+        self.radio_unique.setEnabled(True)
+        if file_type == "merge":
+            self.radio_merge.setChecked(True)
+        else:
+            self.radio_unique.setChecked(True)
+            
+        self.apply_standards_btn.setEnabled(True)
 
     def load_sheet(self) -> None:
         url = self.url_input.text().strip()
@@ -103,7 +272,7 @@ class SRProductsArchiveDialog(QDialog):
             return
         
         self.status_label.setText("Loading...")
-        self.tab_widget.setVisible(False)
+        self.main_splitter.setVisible(False)
         
         try:
             # Convert Dropbox sharing URL to direct download
@@ -132,9 +301,12 @@ class SRProductsArchiveDialog(QDialog):
                 self.sheets_data[sheet_name] = df
             
             self._display_sheets()
+            self.load_vendors()
             self.status_label.setText(f"Successfully loaded {len(self.sheets_data)} sheet(s)")
-            self.tab_widget.setVisible(True)
-            self.process_btn.setVisible(True)
+            
+            # Show the splitter and set sizing (50% / 50% split)
+            self.main_splitter.setVisible(True)
+            self.main_splitter.setSizes([350, 350])
             self.download_btn.setVisible(False)
             
         except requests.exceptions.RequestException as e:
@@ -153,7 +325,12 @@ class SRProductsArchiveDialog(QDialog):
             table.setColumnCount(len(df.columns))
             table.setRowCount(len(df))
             table.setHorizontalHeaderLabels([str(col) for col in df.columns])
-            table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+            
+            # Use interactive resize mode so it is readable if many columns
+            if len(df.columns) > 8:
+                table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+            else:
+                table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
             
             # Fill table with data
             for row_idx, (_, row_data) in enumerate(df.iterrows()):
@@ -164,51 +341,184 @@ class SRProductsArchiveDialog(QDialog):
             # Add table to tab widget
             self.tab_widget.addTab(table, sheet_name)
 
-    def process_excel(self) -> None:
+    def apply_standards(self) -> None:
         if not self.raw_excel_content:
-            QMessageBox.warning(self, "Error", "No Excel file loaded.")
+            QMessageBox.warning(self, "Error", "No loaded Excel content.")
             return
-
-        self.status_label.setText("Processing...")
-        self.tab_widget.setVisible(False)
-        self.process_btn.setEnabled(False)
+            
+        if not self.selected_file_path or not Path(self.selected_file_path).exists():
+            QMessageBox.warning(self, "Error", "Please select a valid vendor file first.")
+            return
+            
+        if 'All' not in self.sheets_data:
+            QMessageBox.warning(self, "Error", "The loaded Excel does not contain a sheet named 'All'.")
+            return
+            
+        self.status_label.setText("Applying standards...")
+        self.apply_standards_btn.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         
         try:
-            from product_parser import process_excel_dataframe
-            excel_file = io.BytesIO(self.raw_excel_content)
-            xls = pd.ExcelFile(excel_file, engine='openpyxl')
+            df_all = self.sheets_data['All']
             
-            self.processed_sheets = {}
+            # Load the selected purchase archives merge sheet (original)
+            selected_path = Path(self.selected_file_path)
+            with pd.ExcelFile(selected_path) as xls:
+                # Determine appropriate sheet name
+                sheet_name = "Invoice Data" if "Invoice Data" in xls.sheet_names else xls.sheet_names[0]
+                df_original_merge = pd.read_excel(xls, sheet_name=sheet_name)
             
-            def find_item_column(columns):
-                for col in columns:
-                    if col.lower() in ['item', 'name', 'product name', 'description']:
-                        return col
-                for col in columns:
-                    if 'item' in col.lower() or 'name' in col.lower():
-                        return col
-                return None
-
-            for sheet_name in xls.sheet_names:
-                df = pd.read_excel(xls, sheet_name=sheet_name)
-                item_col = find_item_column(df.columns)
-                if item_col:
-                    processed_df = process_excel_dataframe(df, item_column=item_col)
+            df_merge_processed = df_original_merge.copy()
+            
+            # Build dictionaries for fast matching on df_all
+            all_by_art_no = {}
+            all_by_item = {}
+            for _, row in df_all.iterrows():
+                art_no = str(row.get('Art No', '')).strip().lower()
+                item_desc = str(row.get('item', '')).strip().lower()
+                if art_no.endswith('.0'):
+                    art_no = art_no[:-2]
+                if art_no and art_no != 'nan':
+                    all_by_art_no[art_no] = row
+                if item_desc and item_desc != 'nan':
+                    all_by_item[item_desc] = row
+                    
+            # Identify columns to add after Vat%
+            vat_col_name = None
+            for col in df_merge_processed.columns:
+                if str(col).lower().replace(' ', '') == 'vat%':
+                    vat_col_name = col
+                    break
+                    
+            if vat_col_name:
+                vat_idx = df_merge_processed.columns.get_loc(vat_col_name)
+            else:
+                vat_idx = len(df_merge_processed.columns) - 1
+                
+            cols_to_add = ['Category', 'Sub-Category', 'Steur', 'unit_price', 'sale_price', 'margin_50', '7 days', 'Barcode']
+            
+            # Drop them if they already exist to insert them at the correct spot
+            for col in cols_to_add:
+                if col in df_merge_processed.columns:
+                    df_merge_processed.drop(columns=[col], inplace=True)
+                    
+            # Insert columns after Vat%
+            current_idx = vat_idx + 1
+            for col in cols_to_add:
+                df_merge_processed.insert(current_idx, col, None)
+                current_idx += 1
+                
+            # If Name column is not in df_merge_processed, insert it
+            if 'Name' not in df_merge_processed.columns:
+                desc_idx = None
+                for c in ['description', 'item_name', 'item name', 'item']:
+                    for col in df_merge_processed.columns:
+                        if c in str(col).lower():
+                            desc_idx = df_merge_processed.columns.get_loc(col)
+                            break
+                    if desc_idx is not None:
+                        break
+                if desc_idx is not None:
+                    df_merge_processed.insert(desc_idx + 1, 'Name', None)
                 else:
-                    processed_df = df
-                self.processed_sheets[sheet_name] = processed_df
+                    df_merge_processed.insert(0, 'Name', None)
+                    
+            # Convert all columns to object type to prevent strict pandas 2.x/Arrow dtype assignment checks
+            for col in df_merge_processed.columns:
+                df_merge_processed[col] = df_merge_processed[col].astype(object)
+
+            # Cache for Barcode: {artno: {item: Barcode}}
+            barcode_cache = {}
             
+            # First pass: compare and find matches, populate cache, write values
+            for idx in range(len(df_merge_processed)):
+                row_merge = df_merge_processed.iloc[idx]
+                
+                # Get item no and description from merge sheet
+                item_no_val = str(row_merge.get('Item No.', '')).strip().lower()
+                if item_no_val.endswith('.0'):
+                    item_no_val = item_no_val[:-2]
+                desc_val = str(row_merge.get('Description', '')).strip().lower()
+                
+                # Find match in loaded sheet All
+                matched_row = None
+                if item_no_val and item_no_val != 'nan' and item_no_val in all_by_art_no:
+                    matched_row = all_by_art_no[item_no_val]
+                elif desc_val and desc_val != 'nan' and desc_val in all_by_item:
+                    matched_row = all_by_item[desc_val]
+                    
+                if matched_row is not None:
+                    # Modify name column value
+                    name_val = matched_row.get('Name')
+                    df_merge_processed.at[idx, 'Name'] = name_val
+                    
+                    # Copy columns
+                    for col in ['Category', 'Sub-Category', 'Steur', 'unit_price', 'sale_price', 'margin_50', '7 days']:
+                        df_merge_processed.at[idx, col] = matched_row.get(col)
+                        
+                    # Barcode logic
+                    barcode_val = matched_row.get('Barcode')
+                    art_no_clean = str(matched_row.get('Art No', '')).strip()
+                    if art_no_clean.endswith('.0'):
+                        art_no_clean = art_no_clean[:-2]
+                    item_clean = str(matched_row.get('item', '')).strip()
+                    
+                    has_barcode = pd.notna(barcode_val) and str(barcode_val).strip() != '' and str(barcode_val).strip().lower() != 'nan'
+                    
+                    if has_barcode:
+                        barcode_str = str(barcode_val).strip()
+                        if barcode_str.endswith('.0'):
+                            barcode_str = barcode_str[:-2]
+                        # Add to cache
+                        if art_no_clean not in barcode_cache:
+                            barcode_cache[art_no_clean] = {}
+                        barcode_cache[art_no_clean][item_clean] = barcode_str
+                        
+                        df_merge_processed.at[idx, 'Barcode'] = barcode_str
+                    else:
+                        df_merge_processed.at[idx, 'Barcode'] = None
+                        
+            # Second pass: fill in barcode from cache for repeat rows
+            for idx in range(len(df_merge_processed)):
+                row_merge = df_merge_processed.iloc[idx]
+                barcode_val = row_merge.get('Barcode')
+                
+                if pd.isna(barcode_val) or str(barcode_val).strip() == '' or str(barcode_val).strip().lower() == 'nan':
+                    item_no_val = str(row_merge.get('Item No.', '')).strip()
+                    if item_no_val.endswith('.0'):
+                        item_no_val = item_no_val[:-2]
+                    desc_val = str(row_merge.get('Description', '')).strip()
+                    
+                    cached_barcode = None
+                    if item_no_val in barcode_cache and desc_val in barcode_cache[item_no_val]:
+                        cached_barcode = barcode_cache[item_no_val][desc_val]
+                        
+                    if cached_barcode:
+                        df_merge_processed.at[idx, 'Barcode'] = cached_barcode
+
+            # Store the result and display
+            self.processed_sheets = {
+                'purchase archives': df_original_merge,
+                'SR standard Archives': df_merge_processed
+            }
             self.sheets_data = self.processed_sheets
             self._display_sheets()
-            self.status_label.setText("Processing complete.")
-            self.tab_widget.setVisible(True)
+            
+            # Switch to the processed sheet tab (index 1)
+            self.tab_widget.setCurrentIndex(1)
+            
+            self.status_label.setText("Successfully applied standards. Displaying sheets.")
             self.download_btn.setVisible(True)
+            self.download_btn.setEnabled(True)
             
         except Exception as e:
-            self.status_label.setText(f"Error: Failed to process file - {str(e)}")
-            QMessageBox.critical(self, "Error", f"Failed to process Excel file:\n{str(e)}")
+            import traceback
+            traceback.print_exc()
+            self.status_label.setText(f"Error applying standards: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to apply standards:\n{str(e)}")
         finally:
-            self.process_btn.setEnabled(True)
+            self.apply_standards_btn.setEnabled(True)
+            QApplication.restoreOverrideCursor()
 
     def download_processed(self) -> None:
         if not self.processed_sheets:
@@ -310,6 +620,12 @@ class SRVendorInvoicesDialog(QDialog):
         self.all_unique_btn.clicked.connect(self.show_all_unique_products)
         self.all_unique_btn.setEnabled(True)
         header_layout.addWidget(self.all_unique_btn)
+
+        self.upload_btn = QPushButton("Upload Invoice")
+        self.upload_btn.setStyleSheet("background-color: #ffc107; color: black; padding: 6px 12px; font-weight: bold; border-radius: 4px;")
+        self.upload_btn.clicked.connect(self.upload_invoice)
+        self.upload_btn.setEnabled(True)
+        header_layout.addWidget(self.upload_btn)
 
         right_layout.addLayout(header_layout)
 
@@ -419,6 +735,59 @@ class SRVendorInvoicesDialog(QDialog):
             pass
             
         return "N/A"
+
+    def upload_invoice(self) -> None:
+        if not self.selected_vendor:
+            QMessageBox.warning(self, "No Vendor", "Please select a vendor first.")
+            return
+
+        options = QFileDialog.Options()
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Upload Invoice PDF",
+            "",
+            "PDF Files (*.pdf)",
+            options=options
+        )
+        if not file_path:
+            return
+
+        try:
+            src_path = Path(file_path)
+            # Destination directory: data/vendors/<vendor_name>/invoices/
+            dest_dir = VENDOR_ROOT / self.selected_vendor.lower() / "invoices"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            
+            dest_path = dest_dir / src_path.name
+            
+            # If a file with the same name already exists in destination, verify overwrite
+            if dest_path.exists():
+                reply = QMessageBox.question(
+                    self,
+                    "Overwrite File?",
+                    f"An invoice with the name '{src_path.name}' already exists.\nDo you want to overwrite it?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if reply != QMessageBox.Yes:
+                    return
+
+            # Read source bytes and write to destination
+            dest_path.write_bytes(src_path.read_bytes())
+            
+            QMessageBox.information(
+                self,
+                "Success",
+                f"Successfully uploaded and saved invoice to:\n{dest_path}"
+            )
+            
+            # Reload invoices list to show new file
+            self.load_invoices()
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Upload Error",
+                f"Failed to upload invoice file:\n{str(e)}"
+            )
 
     def load_invoices(self) -> None:
         self.invoice_list.setRowCount(0)
@@ -982,7 +1351,21 @@ class SRVendorInvoicesDialog(QDialog):
             # Parse the PDF using modular parser
             meta, rows = parser.parse(self.current_pdf_path)
             
-            # Load historical merged data
+            # Save the parsed invoice to the processed directory
+            workspace_root = Path(r"c:\Users\mdtou\PycharmProjects\sr-vendor-handlers")
+            vendor_lower = vendor_name.lower()
+            processed_dir = workspace_root / f"processed_{vendor_lower}"
+            if vendor_lower == "gft":
+                processed_dir = workspace_root / "processed"
+            processed_dir.mkdir(parents=True, exist_ok=True)
+            
+            excel_out_path = processed_dir / f"{self.current_pdf_path.stem}.xlsx"
+            parser.write_excel(meta, rows, excel_out_path)
+            
+            # Regenerate the merged Excel file
+            self.regenerate_merged_file(vendor_lower, processed_dir)
+            
+            # Load historical merged data (now updated with the parsed invoice)
             df_archive = self.load_merged_history()
             
             unique_current_rows = []
@@ -1047,6 +1430,74 @@ class SRVendorInvoicesDialog(QDialog):
             QMessageBox.critical(self, "Parsing Error", f"Failed to parse invoice:\n{str(e)}")
         finally:
             QApplication.restoreOverrideCursor()
+
+    def regenerate_merged_file(self, vendor_lower: str, processed_dir: Path) -> None:
+        try:
+            xlsx_files = list(processed_dir.glob("*.xlsx"))
+            if not xlsx_files:
+                return
+                
+            all_master_rows = []
+            all_summary_rows = []
+            
+            for excel_path in xlsx_files:
+                try:
+                    df_data = pd.read_excel(excel_path, sheet_name="Invoice Data")
+                    df_stat = pd.read_excel(excel_path, sheet_name="Statistics")
+                    
+                    if not df_data.empty:
+                        all_master_rows.append(df_data)
+                    if not df_stat.empty:
+                        all_summary_rows.append(df_stat)
+                except Exception as e:
+                    print(f"Error reading processed file {excel_path} during merge: {e}")
+                    
+            if all_master_rows:
+                df = pd.concat(all_master_rows, ignore_index=True)
+                df_summary = pd.concat(all_summary_rows, ignore_index=True)
+                
+                # Determine date column for sorting
+                date_col = None
+                for c in ["invoice date", "datum", "date"]:
+                    for actual_col in df.columns:
+                        if str(actual_col).lower() == c:
+                            date_col = actual_col
+                            break
+                    if date_col:
+                        break
+                        
+                # Determine summary date column for sorting
+                sum_date_col = None
+                for c in ["invoice date", "datum", "date"]:
+                    for actual_col in df_summary.columns:
+                        if str(actual_col).lower() == c:
+                            sum_date_col = actual_col
+                            break
+                    if sum_date_col:
+                        break
+                
+                if date_col:
+                    df["Datum_parsed"] = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce")
+                    df = df.sort_values(by="Datum_parsed", ascending=False)
+                    df = df.drop(columns=["Datum_parsed"])
+                    
+                if sum_date_col:
+                    df_summary["Datum_parsed"] = pd.to_datetime(df_summary[sum_date_col], dayfirst=True, errors="coerce")
+                    df_summary = df_summary.sort_values(by="Datum_parsed", ascending=False)
+                    df_summary = df_summary.drop(columns=["Datum_parsed"])
+                    
+                workspace_root = Path(r"c:\Users\mdtou\PycharmProjects\sr-vendor-handlers")
+                merged_path = workspace_root / f"merged_{vendor_lower}.xlsx"
+                if vendor_lower == "gft":
+                    merged_path = workspace_root / "merged.xlsx"
+                    
+                with pd.ExcelWriter(merged_path, engine="openpyxl") as writer:
+                    df.to_excel(writer, sheet_name="Invoice Data", index=False)
+                    df_summary.to_excel(writer, sheet_name="Statistics", index=False)
+                    
+                print(f"Successfully regenerated merged history for {vendor_lower} at {merged_path}")
+        except Exception as e:
+            print(f"Error regenerating merged file: {e}")
 
     def populate_table(self, table: QTableWidget, data: List[Dict[str, Any]]) -> None:
         table.clear()
@@ -2519,11 +2970,96 @@ class VendorManagerApp(QMainWindow):
         if not products:
             QMessageBox.warning(self, "Sync failed", f"No product Excel file found for vendor '{vendor}'.")
             return
+        
+        # Try to fill in missing/zero prices from merged invoice history
+        self.enrich_prices_from_history(vendor, products)
+        
         self.db.upsert_vendor_products(vendor, products)
         if self.current_vendor == vendor:
             self._load_products_for_vendor(vendor)
         self._refresh_all_stats()
         QMessageBox.information(self, "Sync complete", f"{len(products)} products synced for {vendor}.")
+
+    def enrich_prices_from_history(self, vendor: str, products: List[Dict[str, Any]]) -> None:
+        vendor_lower = vendor.lower()
+        workspace_root = Path(r"c:\Users\mdtou\PycharmProjects\sr-vendor-handlers")
+        merged_path = workspace_root / f"merged_{vendor_lower}.xlsx"
+        if not merged_path.exists() and vendor_lower == "gft":
+            merged_path = workspace_root / "merged.xlsx"
+            
+        if not merged_path.exists():
+            for f in workspace_root.glob("merged_*.xlsx"):
+                if vendor_lower in f.name.lower():
+                    merged_path = f
+                    break
+                    
+        if not merged_path.exists():
+            return
+            
+        try:
+            df = pd.read_excel(merged_path, sheet_name="Invoice Data")
+            if df.empty:
+                return
+                
+            # Find product ID and price columns
+            id_col = None
+            for c in ["item no.", "artnr", "article", "code", "article number", "itemcode"]:
+                for col in df.columns:
+                    if str(col).lower() == c:
+                        id_col = col
+                        break
+                if id_col:
+                    break
+            if not id_col:
+                id_col = df.columns[0]
+                
+            price_col = None
+            for c in ["price", "net price", "unit price", "rate"]:
+                for col in df.columns:
+                    if str(col).lower() == c:
+                        price_col = col
+                        break
+                if price_col:
+                    break
+            if not price_col:
+                return
+                
+            date_col = None
+            for c in ["invoice date", "datum", "date"]:
+                for col in df.columns:
+                    if str(col).lower() == c:
+                        date_col = col
+                        break
+                if date_col:
+                    break
+                    
+            df_sorted = df.copy()
+            if date_col:
+                df_sorted["_parsed_date"] = pd.to_datetime(df_sorted[date_col], dayfirst=True, errors="coerce")
+                df_sorted = df_sorted.sort_values(by="_parsed_date", ascending=True)
+                
+            latest_prices = {}
+            for _, r in df_sorted.iterrows():
+                sku_val = str(r[id_col]).strip().lower()
+                price_val = r[price_col]
+                try:
+                    price_val = float(price_val)
+                    if not pd.isna(price_val) and price_val > 0:
+                        latest_prices[sku_val] = price_val
+                except (ValueError, TypeError):
+                    pass
+                    
+            enriched_count = 0
+            for p in products:
+                sku = str(p.get("sku") or "").strip().lower()
+                price = p.get("price")
+                if (price is None or price == 0.0 or pd.isna(price)) and sku in latest_prices:
+                    p["price"] = latest_prices[sku]
+                    enriched_count += 1
+                    
+            print(f"Enriched {enriched_count} product prices from purchase history.")
+        except Exception as e:
+            print(f"Error enriching prices from history: {e}")
 
     def open_inventory_dialog(self) -> None:
         if not self.current_vendor:

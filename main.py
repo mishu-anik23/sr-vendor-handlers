@@ -568,8 +568,27 @@ class SRProductsArchiveDialog(QDialog):
         QApplication.setOverrideCursor(Qt.WaitCursor)
         
         try:
+            # Helper functions for robust column resolution
+            def get_row_item_no(r):
+                for k in ['Item No.', 'Art No', 'Item No', 'ArtNo', 'article_no', 'sku']:
+                    val = r.get(k)
+                    if pd.notna(val) and str(val).strip() != '' and str(val).strip().lower() != 'nan':
+                        val_str = str(val).strip()
+                        if val_str.endswith('.0'):
+                            val_str = val_str[:-2]
+                        return val_str
+                return ''
+
+            def get_row_desc(r):
+                for k in ['Description', 'item', 'Name', 'product_name', 'item_name']:
+                    val = r.get(k)
+                    if pd.notna(val) and str(val).strip() != '' and str(val).strip().lower() != 'nan':
+                        return str(val).strip()
+                return ''
+
             # Determine correct source sheet based on selection
             df_source = None
+            product_sheet_name = 'All'
             if self.selected_file_type == 'unique':
                 # Load the product sheet of the loaded excel (sheet next to All)
                 sheet_names = list(self.sheets_data.keys())
@@ -594,8 +613,18 @@ class SRProductsArchiveDialog(QDialog):
             # Load the selected purchase archives merge sheet (original)
             selected_path = Path(self.selected_file_path)
             with pd.ExcelFile(selected_path) as xls:
-                # Determine appropriate sheet name
-                sheet_name = "Invoice Data" if "Invoice Data" in xls.sheet_names else xls.sheet_names[0]
+                # Determine appropriate sheet name (robust lookup)
+                sheet_name = None
+                pref_sheets = ['unique products', 'sr standard archives', 'invoice data', 'purchase archives', 'all', 'produkt', 'product']
+                for pref in pref_sheets:
+                    for s in xls.sheet_names:
+                        if s.lower() == pref:
+                            sheet_name = s
+                            break
+                    if sheet_name:
+                        break
+                if not sheet_name:
+                    sheet_name = xls.sheet_names[0]
                 df_original_merge = pd.read_excel(xls, sheet_name=sheet_name)
             
             df_merge_processed = df_original_merge.copy()
@@ -657,10 +686,10 @@ class SRProductsArchiveDialog(QDialog):
                 inv_num = str(row_merge.get('Invoice Number', '')).strip()
                 if not inv_num or inv_num.lower() == 'nan':
                     # Fallback check
-                    for col in row_merge.index:
-                        if str(col).lower().replace(' ', '').replace('_', '') in ['invoicenumber', 'rechnnr', 'docnr', 'invoiceno']:
-                            inv_num = str(row_merge[col]).strip()
-                            break
+                     for col in row_merge.index:
+                         if str(col).lower().replace(' ', '').replace('_', '') in ['invoicenumber', 'rechnnr', 'docnr', 'invoiceno']:
+                             inv_num = str(row_merge[col]).strip()
+                             break
                 if not inv_num or inv_num.lower() == 'nan':
                     inv_num = f"UNKNOWN_{idx}"
                     
@@ -680,10 +709,8 @@ class SRProductsArchiveDialog(QDialog):
                 rows_to_keep = []
                 for idx in range(len(df_merge_processed)):
                     row = df_merge_processed.iloc[idx]
-                    item_no = str(row.get('Item No.', '')).strip().lower()
-                    if item_no.endswith('.0'):
-                        item_no = item_no[:-2]
-                    desc = str(row.get('Description', '')).strip().lower()
+                    item_no = get_row_item_no(row).lower()
+                    desc = get_row_desc(row).lower()
                     prod_key = (item_no, desc)
                     if prod_key not in seen_keys:
                         seen_keys.add(prod_key)
@@ -787,10 +814,8 @@ class SRProductsArchiveDialog(QDialog):
                 row_merge = df_merge_processed.iloc[idx]
                 
                 # Get item no, description, and vendor from merge sheet
-                item_no_val = str(row_merge.get('Item No.', '')).strip().lower()
-                if item_no_val.endswith('.0'):
-                    item_no_val = item_no_val[:-2]
-                desc_val = str(row_merge.get('Description', '')).strip().lower()
+                item_no_val = get_row_item_no(row_merge).lower()
+                desc_val = get_row_desc(row_merge).lower()
                 vendor_val = str(row_merge.get('Vendor', '')).strip().lower()
                 
                 matched_row = None
@@ -851,10 +876,8 @@ class SRProductsArchiveDialog(QDialog):
                 barcode_val = row_merge.get('Barcode')
                 
                 if pd.isna(barcode_val) or str(barcode_val).strip() == '' or str(barcode_val).strip().lower() == 'nan':
-                    item_no_val = str(row_merge.get('Item No.', '')).strip()
-                    if item_no_val.endswith('.0'):
-                        item_no_val = item_no_val[:-2]
-                    desc_val = str(row_merge.get('Description', '')).strip()
+                    item_no_val = get_row_item_no(row_merge)
+                    desc_val = get_row_desc(row_merge)
                     
                     cached_barcode = None
                     if item_no_val in barcode_cache and desc_val in barcode_cache[item_no_val]:
@@ -863,11 +886,60 @@ class SRProductsArchiveDialog(QDialog):
                     if cached_barcode:
                         df_merge_processed.at[idx, 'Barcode'] = cached_barcode
 
+            # Create Statistics DataFrame
+            stats_data = []
+            stats_data.append(("Calculation Date", pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")))
+            stats_data.append(("Source Sheet Used", 'All' if self.selected_file_type != 'unique' else product_sheet_name))
+            stats_data.append(("Input File Rows", len(df_original_merge)))
+            stats_data.append(("Processed Rows", len(df_merge_processed)))
+            
+            # Find unique products in original
+            item_col_orig = None
+            for col in df_original_merge.columns:
+                if str(col).lower() in ['item no.', 'item no', 'art no', 'art_no', 'artno']:
+                    item_col_orig = col
+                    break
+            if item_col_orig:
+                unique_orig = df_original_merge[item_col_orig].nunique()
+                stats_data.append(("Input Unique Items", unique_orig))
+                
+            # Find unique products in processed
+            item_col_proc = None
+            for col in df_merge_processed.columns:
+                if str(col).lower() in ['item no.', 'item no', 'art no', 'art_no', 'artno']:
+                    item_col_proc = col
+                    break
+            if item_col_proc:
+                unique_proc = df_merge_processed[item_col_proc].nunique()
+                stats_data.append(("Processed Unique Items", unique_proc))
+                
+            # Find unique vendors in processed
+            if 'Vendor' in df_merge_processed.columns:
+                unique_vendors = df_merge_processed['Vendor'].nunique()
+                stats_data.append(("Total Vendors Detected", unique_vendors))
+                
+            # Date range
+            if date_col_name and date_col_name in df_merge_processed.columns:
+                df_temp_dates = pd.to_datetime(df_merge_processed[date_col_name], dayfirst=True, errors='coerce').dropna()
+                if not df_temp_dates.empty:
+                    stats_data.append(("First Purchase Date", df_temp_dates.min().strftime("%Y-%m-%d")))
+                    stats_data.append(("Last Purchase Date", df_temp_dates.max().strftime("%Y-%m-%d")))
+                    
+            df_stats = pd.DataFrame(stats_data, columns=["Field", "Value"])
+
             # Store the result and display
-            self.processed_sheets = {
-                'purchase archives': df_original_merge,
-                'SR standard Archives': df_merge_processed
-            }
+            if self.selected_file_type == 'unique':
+                self.processed_sheets = {
+                    'purchase archives': df_original_merge,
+                    'unique products': df_merge_processed,
+                    'Statistics': df_stats
+                }
+            else:
+                self.processed_sheets = {
+                    'purchase archives': df_original_merge,
+                    'SR standard Archives': df_merge_processed,
+                    'Statistics': df_stats
+                }
             self._display_sheets(self.processed_sheets)
             
             # Switch to the processed sheet tab (index 1)

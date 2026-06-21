@@ -106,9 +106,10 @@ class TestApplyStandards(unittest.TestCase):
         # Run apply_sunrise_standard
         dialog.apply_sunrise_standard()
         
-        # Assert processing succeeded and created 2 sheets
+        # Assert processing succeeded and created 3 sheets
         self.assertIn('purchase archives', dialog.processed_sheets)
         self.assertIn('SR standard Archives', dialog.processed_sheets)
+        self.assertIn('Statistics', dialog.processed_sheets)
         
         df_processed = dialog.processed_sheets['SR standard Archives']
         
@@ -153,11 +154,12 @@ class TestApplyStandards(unittest.TestCase):
         # Run apply_sunrise_standard
         dialog.apply_sunrise_standard()
         
-        # Assert processing succeeded and created 2 sheets
+        # Assert processing succeeded and created 3 sheets
         self.assertIn('purchase archives', dialog.processed_sheets)
-        self.assertIn('SR standard Archives', dialog.processed_sheets)
+        self.assertIn('unique products', dialog.processed_sheets)
+        self.assertIn('Statistics', dialog.processed_sheets)
         
-        df_processed = dialog.processed_sheets['SR standard Archives']
+        df_processed = dialog.processed_sheets['unique products']
         
         # Deduplication check: INV-4 (Cherry Pie reorder) should have been dropped.
         # Total rows should be 3 (INV-1, INV-2, INV-3)
@@ -264,9 +266,10 @@ class TestApplyStandards(unittest.TestCase):
             if merge_excel_path_existing.exists():
                 merge_excel_path_existing.unlink()
                 
-        # Assert processing succeeded and created 2 sheets without index errors
+        # Assert processing succeeded and created 3 sheets without index errors
         self.assertIn('purchase archives', dialog.processed_sheets)
-        self.assertIn('SR standard Archives', dialog.processed_sheets)
+        self.assertIn('unique products', dialog.processed_sheets)
+        self.assertIn('Statistics', dialog.processed_sheets)
 
 if __name__ == "__main__":
     unittest.main()

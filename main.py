@@ -501,9 +501,20 @@ class SRProductsArchiveDialog(QDialog):
                         else:
                             url += '?dl=1'
                 
-                # Fetch file
+                # Fetch file with cache-busting logic if force_fetch is requested
                 headers = {'User-Agent': 'Mozilla/5.0'}
-                response = requests.get(url, headers=headers, timeout=30)
+                fetch_url = url
+                if force_fetch:
+                    headers['Cache-Control'] = 'no-cache'
+                    headers['Pragma'] = 'no-cache'
+                    import time
+                    cb = int(time.time())
+                    if '?' in fetch_url:
+                        fetch_url += f"&cb={cb}"
+                    else:
+                        fetch_url += f"?cb={cb}"
+                
+                response = requests.get(fetch_url, headers=headers, timeout=30)
                 response.raise_for_status()
                 excel_bytes = response.content
                 
@@ -580,8 +591,18 @@ class SRProductsArchiveDialog(QDialog):
             # Fill table with data
             for row_idx, (_, row_data) in enumerate(df.iterrows()):
                 for col_idx, value in enumerate(row_data):
-                    item = QTableWidgetItem(str(value) if value is not None and str(value) != 'nan' else '')
+                    val_str = str(value) if value is not None and str(value) != 'nan' else ''
+                    item = QTableWidgetItem(val_str)
+                    if val_str:
+                        item.setToolTip(val_str)
                     table.setItem(row_idx, col_idx, item)
+            
+            # Set specific column widths for Item, Name, and Description
+            for col_idx, col in enumerate(df.columns):
+                c_name = str(col).lower().replace(' ', '').replace('_', '')
+                if c_name in ['item', 'name', 'description']:
+                    table.horizontalHeader().setSectionResizeMode(col_idx, QHeaderView.Interactive)
+                    table.setColumnWidth(col_idx, 350)
             
             # Add table to tab widget
             self.tab_widget.addTab(table, sheet_name)

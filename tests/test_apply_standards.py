@@ -236,5 +236,37 @@ class TestApplyStandards(unittest.TestCase):
         self.assertIn('All', dialog.sheets_data)
         self.assertIn('product', dialog.sheets_data)
 
+    def test_apply_standards_with_existing_columns_does_not_raise_index_error(self):
+        # Create a mock merge/unique sheet DataFrame that already contains the target columns
+        df_existing_cols = self.df_merge_data.copy()
+        # Add pre-existing columns
+        for col in ['Category', 'Sub-Category', 'Steur', 'Tag', 'Kassen', 'Rack']:
+            df_existing_cols[col] = "existing_val"
+            
+        merge_excel_path_existing = self.tmp_dir / "merge_sheet_existing.xlsx"
+        with pd.ExcelWriter(merge_excel_path_existing, engine='openpyxl') as writer:
+            df_existing_cols.to_excel(writer, sheet_name="Invoice Data", index=False)
+            
+        dialog = SRProductsArchiveDialog(parent=None)
+        dialog.selected_vendor_name = "asiaexpress"
+        dialog.sheets_data = {
+            'All': self.df_all_data,
+            'product': self.df_product_data
+        }
+        dialog.raw_excel_content = b"fake excel content"
+        dialog.selected_file_path = str(merge_excel_path_existing)
+        dialog.selected_file_type = "unique" # Test unique because it inserts the most columns
+        
+        try:
+            # This should not raise an IndexError
+            dialog.apply_sunrise_standard()
+        finally:
+            if merge_excel_path_existing.exists():
+                merge_excel_path_existing.unlink()
+                
+        # Assert processing succeeded and created 2 sheets without index errors
+        self.assertIn('purchase archives', dialog.processed_sheets)
+        self.assertIn('SR standard Archives', dialog.processed_sheets)
+
 if __name__ == "__main__":
     unittest.main()

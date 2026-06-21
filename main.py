@@ -690,6 +690,13 @@ class SRProductsArchiveDialog(QDialog):
                         rows_to_keep.append(idx)
                 df_merge_processed = df_merge_processed.iloc[rows_to_keep].reset_index(drop=True)
 
+            cols_to_add = ['Category', 'Sub-Category', 'Steur', 'unit_price', 'sale_price', 'margin_50', '7 days', 'Barcode']
+            
+            # Drop them first if they already exist
+            for col in cols_to_add:
+                if col in df_merge_processed.columns:
+                    df_merge_processed.drop(columns=[col], inplace=True)
+
             # Identify columns to add after Vat%
             vat_col_name = None
             for col in df_merge_processed.columns:
@@ -702,13 +709,6 @@ class SRProductsArchiveDialog(QDialog):
             else:
                 vat_idx = len(df_merge_processed.columns) - 1
                 
-            cols_to_add = ['Category', 'Sub-Category', 'Steur', 'unit_price', 'sale_price', 'margin_50', '7 days', 'Barcode']
-            
-            # Drop them if they already exist to insert them at the correct spot
-            for col in cols_to_add:
-                if col in df_merge_processed.columns:
-                    df_merge_processed.drop(columns=[col], inplace=True)
-                    
             # Insert columns after Vat%
             current_idx = vat_idx + 1
             for col in cols_to_add:
@@ -717,6 +717,11 @@ class SRProductsArchiveDialog(QDialog):
                 
             # If unique file, add 3 new columns after Steur: Tag, Kassen, Rack
             if self.selected_file_type == 'unique':
+                cols_to_add_unique = ['Tag', 'Kassen', 'Rack']
+                for col in cols_to_add_unique:
+                    if col in df_merge_processed.columns:
+                        df_merge_processed.drop(columns=[col], inplace=True)
+                        
                 steur_idx = None
                 for i, col in enumerate(df_merge_processed.columns):
                     if str(col).lower() == 'steur':
@@ -725,11 +730,6 @@ class SRProductsArchiveDialog(QDialog):
                 if steur_idx is None:
                     steur_idx = len(df_merge_processed.columns) - 1
                     
-                cols_to_add_unique = ['Tag', 'Kassen', 'Rack']
-                for col in cols_to_add_unique:
-                    if col in df_merge_processed.columns:
-                        df_merge_processed.drop(columns=[col], inplace=True)
-                        
                 current_idx = steur_idx + 1
                 for col in cols_to_add_unique:
                     df_merge_processed.insert(current_idx, col, None)

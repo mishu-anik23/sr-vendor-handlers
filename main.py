@@ -126,9 +126,24 @@ class SRProductsArchiveDialog(QDialog):
         self.main_splitter.setVisible(False)
         layout.addWidget(self.main_splitter)
         
-        # Tab widget for sheets (upper half)
+        # Upper container for sheets and table search filter (upper half)
+        self.upper_container = QWidget()
+        upper_layout = QVBoxLayout(self.upper_container)
+        upper_layout.setContentsMargins(0, 0, 0, 0)
+        
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(QLabel("<b>Table Filter Search:</b>"))
+        self.tab_search_input = QLineEdit()
+        self.tab_search_input.setPlaceholderText("Type to search/filter rows in the visible table...")
+        self.tab_search_input.textChanged.connect(self.filter_current_tab_table)
+        filter_layout.addWidget(self.tab_search_input)
+        upper_layout.addLayout(filter_layout)
+        
         self.tab_widget = QTabWidget()
-        self.main_splitter.addWidget(self.tab_widget)
+        self.tab_widget.currentChanged.connect(self.filter_current_tab_table)
+        upper_layout.addWidget(self.tab_widget)
+        
+        self.main_splitter.addWidget(self.upper_container)
         
         # Bottom panel (lower half)
         self.bottom_panel = QWidget()
@@ -213,6 +228,22 @@ class SRProductsArchiveDialog(QDialog):
             self.showFullScreen()
             self.fullscreen_btn.setText("Normal Screen")
 
+    def filter_current_tab_table(self) -> None:
+        query = self.tab_search_input.text().strip().lower()
+        current_table = self.tab_widget.currentWidget()
+        if isinstance(current_table, QTableWidget):
+            for row in range(current_table.rowCount()):
+                if not query:
+                    current_table.setRowHidden(row, False)
+                    continue
+                match = False
+                for col in range(current_table.columnCount()):
+                    item = current_table.item(row, col)
+                    if item and query in item.text().lower():
+                        match = True
+                        break
+                current_table.setRowHidden(row, not match)
+
     def auto_load_default_session(self) -> None:
         default_file = self.cache_dir / "default_session.xlsx"
         if default_file.exists():
@@ -272,9 +303,12 @@ class SRProductsArchiveDialog(QDialog):
             
         unique_path = workspace_root / f"unique_{vendor_lower}.xlsx"
         if not unique_path.exists():
-            unique_path = workspace_root / f"processed_{vendor_lower}.xlsx"
-        if not unique_path.exists():
-            unique_path = workspace_root / "processed_products.xlsx"
+            unique_path = workspace_root / f"{vendor_lower}_unique_products.xlsx"
+            
+        unique_exists = unique_path.exists()
+        if not unique_exists:
+            # Fallback: auto calculated from merged file
+            unique_path = merged_path
             
         # Add items to the files list if they exist, or display with a warning
         merged_item = QListWidgetItem(f"Merged Purchased Archives ({merged_path.name})")
@@ -285,10 +319,12 @@ class SRProductsArchiveDialog(QDialog):
             merged_item.setFlags(merged_item.flags() & ~Qt.ItemIsEnabled)
         self.vendor_files_list.addItem(merged_item)
         
-        unique_item = QListWidgetItem(f"Unique Products ({unique_path.name})")
+        unique_item_name = f"Unique Products ({unique_path.name})" if unique_exists else f"Unique Products (Auto-calculate from Merged)"
+        unique_item = QListWidgetItem(unique_item_name)
         unique_item.setData(Qt.UserRole, str(unique_path))
         unique_item.setData(Qt.UserRole + 1, "unique")
-        if not unique_path.exists():
+        # Always enable the unique option if unique_exists or merged_path exists
+        if not unique_exists and not merged_path.exists():
             unique_item.setText(f"Unique Products (Not Found)")
             unique_item.setFlags(unique_item.flags() & ~Qt.ItemIsEnabled)
         self.vendor_files_list.addItem(unique_item)
@@ -549,6 +585,8 @@ class SRProductsArchiveDialog(QDialog):
             
             # Add table to tab widget
             self.tab_widget.addTab(table, sheet_name)
+            
+        self.filter_current_tab_table()
 
     def apply_sunrise_standard(self) -> None:
         if not self.raw_excel_content:
@@ -585,6 +623,39 @@ class SRProductsArchiveDialog(QDialog):
                     if pd.notna(val) and str(val).strip() != '' and str(val).strip().lower() != 'nan':
                         return str(val).strip()
                 return ''
+
+            def get_matched_unit_price(mr):
+                for k in ['/pc preis', '/pc pres', 'unit_price', '/pcpreis']:
+                    if k in mr:
+                        return mr[k]
+                for k in mr.index:
+                    if '/pc' in str(k).lower() or 'preis' in str(k).lower():
+                        return mr[k]
+                return None
+
+            def get_matched_sale_price(mr):
+                for k in ['Sale price ', 'sale_price', 'Sale price', 'sale price']:
+                    if k in mr:
+                        return mr[k]
+                cols = list(mr.index)
+                for k in ['/pc preis', '/pc pres', '/pcpreis']:
+                    if k in cols:
+                        idx = cols.index(k)
+                        if idx + 1 < len(cols):
+                            return mr.iloc[idx + 1]
+                return None
+
+            def get_matched_margin_50(mr):
+                for k in ['margin_50', 'margin', 'Margin']:
+                    if k in mr:
+                        return mr[k]
+                cols = list(mr.index)
+                for k in ['/pc preis', '/pc pres', '/pcpreis']:
+                    if k in cols:
+                        idx = cols.index(k)
+                        if idx + 2 < len(cols):
+                            return mr.iloc[idx + 2]
+                return None
 
             # Determine correct source sheet based on selection
             df_source = None
@@ -717,7 +788,10 @@ class SRProductsArchiveDialog(QDialog):
                         rows_to_keep.append(idx)
                 df_merge_processed = df_merge_processed.iloc[rows_to_keep].reset_index(drop=True)
 
-            cols_to_add = ['Category', 'Sub-Category', 'Steur', 'unit_price', 'sale_price', 'margin_50', '7 days', 'Barcode']
+            if self.selected_file_type == 'unique':
+                cols_to_add = ['Brand', 'Category', 'Sub-Category', 'Steur', 'unit_price', 'sale_price', 'margin_50', '7 days', 'Barcode', 'sku', 'inv', 'total cost']
+            else:
+                cols_to_add = ['Category', 'Sub-Category', 'Steur', 'unit_price', 'sale_price', 'margin_50', '7 days', 'Barcode']
             
             # Drop them first if they already exist
             for col in cols_to_add:
@@ -840,13 +914,43 @@ class SRProductsArchiveDialog(QDialog):
                     df_merge_processed.at[idx, 'Name'] = name_val
                     
                     # Copy standard columns
-                    for col in ['Category', 'Sub-Category', 'Steur', 'unit_price', 'sale_price', 'margin_50', '7 days']:
+                    for col in ['Category', 'Sub-Category', '7 days']:
                         df_merge_processed.at[idx, col] = matched_row.get(col)
                         
+                    # Copy Steur/Stuer
+                    steur_val = matched_row.get('Steur') if 'Steur' in matched_row else matched_row.get('Stuer')
+                    df_merge_processed.at[idx, 'Steur'] = steur_val
+                    
+                    # Copy unit_price, sale_price, margin_50 using our robust helpers
+                    df_merge_processed.at[idx, 'unit_price'] = get_matched_unit_price(matched_row)
+                    df_merge_processed.at[idx, 'sale_price'] = get_matched_sale_price(matched_row)
+                    df_merge_processed.at[idx, 'margin_50'] = get_matched_margin_50(matched_row)
+                    
                     # Copy unique columns if selected file is unique
                     if self.selected_file_type == 'unique':
                         for col in ['Tag', 'Kassen', 'Rack']:
                             df_merge_processed.at[idx, col] = matched_row.get(col)
+                            
+                        # Copy Brand, sku, inv, total cost
+                        brand_val = matched_row.get('Brand') if 'Brand' in matched_row else matched_row.get('brand')
+                        df_merge_processed.at[idx, 'Brand'] = brand_val
+                        
+                        sku_val = matched_row.get('sku') if 'sku' in matched_row else matched_row.get('SKU')
+                        df_merge_processed.at[idx, 'sku'] = sku_val
+                        
+                        inv_val = None
+                        for k in ['inv', 'stock', 'stock_qty', 'qty']:
+                            if k in matched_row:
+                                inv_val = matched_row.get(k)
+                                break
+                        df_merge_processed.at[idx, 'inv'] = inv_val
+                        
+                        tc_val = None
+                        for k in ['total cost', 'total_cost', 'totalcost']:
+                            if k in matched_row:
+                                tc_val = matched_row.get(k)
+                                break
+                        df_merge_processed.at[idx, 'total cost'] = tc_val
                         
                     # Barcode logic
                     barcode_val = matched_row.get('Barcode')

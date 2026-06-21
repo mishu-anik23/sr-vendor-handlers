@@ -52,7 +52,11 @@ class TestApplyStandards(unittest.TestCase):
             'Vendor': ['VendorA', 'VendorB', 'VendorC'],
             'Tag': ['TagA', 'TagB', 'TagC'],
             'Kassen': ['K1', 'K2', 'K3'],
-            'Rack': ['R1', 'R2', 'R3']
+            'Rack': ['R1', 'R2', 'R3'],
+            'Brand': ['BrandA', 'BrandB', 'BrandC'],
+            'sku': ['SKU-A', 'SKU-B', 'SKU-C'],
+            'inv': [100, 200, 300],
+            'total cost': [120.0, 300.0, 750.0]
         })
         
         # 2. Create a dummy merge sheet (purchase archives) with dates out of order to verify sorting
@@ -176,6 +180,12 @@ class TestApplyStandards(unittest.TestCase):
         # Cherry Pie (INV-3) -> 'asian2' (since it was the first occurrence)
         self.assertEqual(df_processed.at[2, 'Name'], 'Red Cherry Pie Unique')
         self.assertEqual(df_processed.at[2, 'Vendor'], 'asian2')
+        
+        # Verify brand, sku, inv, total cost copied correctly
+        self.assertEqual(df_processed.at[0, 'Brand'], 'BrandA')
+        self.assertEqual(df_processed.at[0, 'sku'], 'SKU-A')
+        self.assertEqual(df_processed.at[0, 'inv'], 100)
+        self.assertEqual(df_processed.at[0, 'total cost'], 120.0)
         
         # Assert master sheets_data was preserved and not overwritten
         self.assertIn('All', dialog.sheets_data)

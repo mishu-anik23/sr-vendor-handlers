@@ -440,7 +440,26 @@ class SRProductsArchiveDialog(QDialog):
             
             df_merge_processed = df_original_merge.copy()
 
-            # Insert 'Vendor' column value in between column 'Invoice Date' and 'Invoice Number'
+            # 1. Rearrange from oldest order (sort chronologically)
+            date_col_name = None
+            for col in df_merge_processed.columns:
+                if str(col).lower().replace(' ', '').replace('_', '').replace('.', '') in ['invoicedate', 'datum', 'date']:
+                    date_col_name = col
+                    break
+                    
+            if date_col_name:
+                # Parse temporary datetime series for sorting
+                df_merge_processed['_temp_parsed_date'] = pd.to_datetime(
+                    df_merge_processed[date_col_name],
+                    dayfirst=True,
+                    errors='coerce'
+                )
+                # Sort ascending, keeping original index order for ties (stable sort)
+                df_merge_processed.sort_values(by='_temp_parsed_date', ascending=True, kind='stable', inplace=True)
+                df_merge_processed.reset_index(drop=True, inplace=True)
+                df_merge_processed.drop(columns=['_temp_parsed_date'], inplace=True)
+
+            # 2. Insert 'Vendor' column value in between column 'Invoice Date' and 'Invoice Number'
             if 'Vendor' in df_merge_processed.columns:
                 df_merge_processed.drop(columns=['Vendor'], inplace=True)
                 
@@ -462,6 +481,55 @@ class SRProductsArchiveDialog(QDialog):
                 
             df_merge_processed.insert(insert_idx, 'Vendor', None)
             
+            # Convert all columns to object type to prevent strict Arrow/pandas 2.x dtype Checks
+            for col in df_merge_processed.columns:
+                df_merge_processed[col] = df_merge_processed[col].astype(object)
+
+            # 3. Populate Vendor column values based on chronological invoice order
+            vendor_lower = self.selected_vendor_name.lower() if self.selected_vendor_name else "vendor"
+            base_name = "asian" if "asia" in vendor_lower else vendor_lower
+            
+            invoice_to_vendor_val = {}
+            unique_invoice_counter = 0
+            
+            for idx in range(len(df_merge_processed)):
+                row_merge = df_merge_processed.iloc[idx]
+                inv_num = str(row_merge.get('Invoice Number', '')).strip()
+                if not inv_num or inv_num.lower() == 'nan':
+                    # Fallback check
+                    for col in row_merge.index:
+                        if str(col).lower().replace(' ', '').replace('_', '') in ['invoicenumber', 'rechnnr', 'docnr', 'invoiceno']:
+                            inv_num = str(row_merge[col]).strip()
+                            break
+                if not inv_num or inv_num.lower() == 'nan':
+                    inv_num = f"UNKNOWN_{idx}"
+                    
+                if inv_num not in invoice_to_vendor_val:
+                    if unique_invoice_counter == 0:
+                        invoice_to_vendor_val[inv_num] = base_name
+                    else:
+                        invoice_to_vendor_val[inv_num] = f"{base_name}{unique_invoice_counter}"
+                    unique_invoice_counter += 1
+                    
+                df_merge_processed.at[idx, 'Vendor'] = invoice_to_vendor_val[inv_num]
+
+            # 4. For unique file, keep only the first (oldest) entry of each unique product
+            # so the first time entry of vendor value is considered in Vendor Column value.
+            if self.selected_file_type == 'unique':
+                seen_keys = set()
+                rows_to_keep = []
+                for idx in range(len(df_merge_processed)):
+                    row = df_merge_processed.iloc[idx]
+                    item_no = str(row.get('Item No.', '')).strip().lower()
+                    if item_no.endswith('.0'):
+                        item_no = item_no[:-2]
+                    desc = str(row.get('Description', '')).strip().lower()
+                    prod_key = (item_no, desc)
+                    if prod_key not in seen_keys:
+                        seen_keys.add(prod_key)
+                        rows_to_keep.append(idx)
+                df_merge_processed = df_merge_processed.iloc[rows_to_keep].reset_index(drop=True)
+
             # Identify columns to add after Vat%
             vat_col_name = None
             for col in df_merge_processed.columns:
@@ -585,11 +653,6 @@ class SRProductsArchiveDialog(QDialog):
                     # Modify name column value
                     name_val = matched_row.get('Name')
                     df_merge_processed.at[idx, 'Name'] = name_val
-                    
-                    # Copy Vendor column value
-                    source_vendor = matched_row.get('Vendor')
-                    if pd.notna(source_vendor):
-                        df_merge_processed.at[idx, 'Vendor'] = source_vendor
                     
                     # Copy standard columns
                     for col in ['Category', 'Sub-Category', 'Steur', 'unit_price', 'sale_price', 'margin_50', '7 days']:

@@ -62,6 +62,9 @@ class SRProductsArchiveDialog(QDialog):
         self.selected_file_path = None
         self.selected_file_type = None
         self.selected_vendor_name = None
+        self.cache_dir = Path(__file__).resolve().parent / "data" / "cache"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.force_fresh_fetch = False
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -77,6 +80,11 @@ class SRProductsArchiveDialog(QDialog):
         load_btn = QPushButton("Load Sheet")
         load_btn.clicked.connect(self.load_sheet)
         url_layout.addWidget(load_btn)
+
+        self.fetch_new_btn = QPushButton("Fetch New Data")
+        self.fetch_new_btn.setStyleSheet("background-color: #ffc107; color: black; font-weight: bold;")
+        self.fetch_new_btn.clicked.connect(self.fetch_new_data)
+        url_layout.addWidget(self.fetch_new_btn)
 
         self.fullscreen_btn = QPushButton("Fullscreen")
         self.fullscreen_btn.setStyleSheet("background-color: #6c757d; color: white;")
@@ -157,12 +165,12 @@ class SRProductsArchiveDialog(QDialog):
 
         # Button layout
         right_layout.addStretch()
-        self.apply_standards_btn = QPushButton("Apply Standards")
+        self.apply_standards_btn = QPushButton("Apply Sunrise Standard")
         self.apply_standards_btn.setEnabled(False)
         self.apply_standards_btn.setStyleSheet(
             "background-color: #28a745; color: white; font-size: 13pt; font-weight: bold; padding: 12px; border-radius: 5px;"
         )
-        self.apply_standards_btn.clicked.connect(self.apply_standards)
+        self.apply_standards_btn.clicked.connect(self.apply_sunrise_standard)
         right_layout.addWidget(self.apply_standards_btn)
 
         self.bottom_splitter.addWidget(right_widget)
@@ -265,6 +273,10 @@ class SRProductsArchiveDialog(QDialog):
             
         self.apply_standards_btn.setEnabled(True)
 
+    def fetch_new_data(self) -> None:
+        self.force_fresh_fetch = True
+        self.load_sheet()
+
     def load_sheet(self) -> None:
         url = self.url_input.text().strip()
         if not url:
@@ -274,25 +286,61 @@ class SRProductsArchiveDialog(QDialog):
         self.status_label.setText("Loading...")
         self.main_splitter.setVisible(False)
         
+        # Determine cache file path for this URL
+        import hashlib
+        url_hash = hashlib.sha256(url.encode('utf-8')).hexdigest()
+        cache_file_path = self.cache_dir / f"{url_hash}.xlsx"
+        
+        force_fetch = getattr(self, "force_fresh_fetch", False)
+        self.force_fresh_fetch = False # reset
+        
+        excel_bytes = None
+        loaded_from_cache = False
+        
+        if cache_file_path.exists() and not force_fetch:
+            try:
+                with open(cache_file_path, "rb") as f:
+                    excel_bytes = f.read()
+                loaded_from_cache = True
+            except Exception as e:
+                print(f"Error reading cache file: {e}")
+                
+        if excel_bytes is None:
+            try:
+                # Convert Dropbox sharing URL to direct download
+                if 'dropbox.com' in url:
+                    url = url.replace('dl=0', 'dl=1')
+                    if 'dl=1' not in url:
+                        if '?' in url:
+                            url += '&dl=1'
+                        else:
+                            url += '?dl=1'
+                
+                # Fetch file
+                headers = {'User-Agent': 'Mozilla/5.0'}
+                response = requests.get(url, headers=headers, timeout=30)
+                response.raise_for_status()
+                excel_bytes = response.content
+                
+                # Save to cache
+                self.cache_dir.mkdir(parents=True, exist_ok=True)
+                with open(cache_file_path, "wb") as f:
+                    f.write(excel_bytes)
+                
+            except requests.exceptions.RequestException as e:
+                self.status_label.setText(f"Error: Failed to fetch file - {str(e)}")
+                QMessageBox.critical(self, "Error", f"Failed to fetch file:\n{str(e)}")
+                return
+            except Exception as e:
+                self.status_label.setText(f"Error: Failed to write cache - {str(e)}")
+                QMessageBox.critical(self, "Error", f"Failed to write cache:\n{str(e)}")
+                return
+        
         try:
-            # Convert Dropbox sharing URL to direct download
-            if 'dropbox.com' in url:
-                url = url.replace('dl=0', 'dl=1')
-                if 'dl=1' not in url:
-                    if '?' in url:
-                        url += '&dl=1'
-                    else:
-                        url += '?dl=1'
-            
-            # Fetch file
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            response = requests.get(url, headers=headers, timeout=30)
-            response.raise_for_status()
-            
-            self.raw_excel_content = response.content
+            self.raw_excel_content = excel_bytes
             
             # Parse Excel
-            excel_file = io.BytesIO(response.content)
+            excel_file = io.BytesIO(excel_bytes)
             xls = pd.ExcelFile(excel_file, engine='openpyxl')
             
             self.sheets_data = {}
@@ -302,16 +350,17 @@ class SRProductsArchiveDialog(QDialog):
             
             self._display_sheets()
             self.load_vendors()
-            self.status_label.setText(f"Successfully loaded {len(self.sheets_data)} sheet(s)")
+            
+            if loaded_from_cache:
+                self.status_label.setText(f"Successfully loaded {len(self.sheets_data)} sheet(s) from Cache (Materialized View)")
+            else:
+                self.status_label.setText(f"Successfully fetched and cached {len(self.sheets_data)} sheet(s)")
             
             # Show the splitter and set sizing (50% / 50% split)
             self.main_splitter.setVisible(True)
             self.main_splitter.setSizes([350, 350])
             self.download_btn.setVisible(False)
             
-        except requests.exceptions.RequestException as e:
-            self.status_label.setText(f"Error: Failed to fetch file - {str(e)}")
-            QMessageBox.critical(self, "Error", f"Failed to fetch file:\n{str(e)}")
         except Exception as e:
             self.status_label.setText(f"Error: Failed to parse file - {str(e)}")
             QMessageBox.critical(self, "Error", f"Failed to parse Excel file:\n{str(e)}")
@@ -341,7 +390,7 @@ class SRProductsArchiveDialog(QDialog):
             # Add table to tab widget
             self.tab_widget.addTab(table, sheet_name)
 
-    def apply_standards(self) -> None:
+    def apply_sunrise_standard(self) -> None:
         if not self.raw_excel_content:
             QMessageBox.warning(self, "Error", "No loaded Excel content.")
             return
@@ -359,8 +408,29 @@ class SRProductsArchiveDialog(QDialog):
         QApplication.setOverrideCursor(Qt.WaitCursor)
         
         try:
-            df_all = self.sheets_data['All']
-            
+            # Determine correct source sheet based on selection
+            df_source = None
+            if self.selected_file_type == 'unique':
+                # Load the product sheet of the loaded excel (sheet next to All)
+                sheet_names = list(self.sheets_data.keys())
+                product_sheet_name = None
+                if 'All' in sheet_names:
+                    all_idx = sheet_names.index('All')
+                    if all_idx + 1 < len(sheet_names):
+                        product_sheet_name = sheet_names[all_idx + 1]
+                if not product_sheet_name:
+                    for s in sheet_names:
+                        if 'product' in s.lower():
+                            product_sheet_name = s
+                            break
+                if not product_sheet_name and len(sheet_names) > 1:
+                    product_sheet_name = sheet_names[1]
+                if not product_sheet_name:
+                    product_sheet_name = 'All'
+                df_source = self.sheets_data[product_sheet_name]
+            else:
+                df_source = self.sheets_data['All']
+
             # Load the selected purchase archives merge sheet (original)
             selected_path = Path(self.selected_file_path)
             with pd.ExcelFile(selected_path) as xls:
@@ -369,20 +439,29 @@ class SRProductsArchiveDialog(QDialog):
                 df_original_merge = pd.read_excel(xls, sheet_name=sheet_name)
             
             df_merge_processed = df_original_merge.copy()
-            
-            # Build dictionaries for fast matching on df_all
-            all_by_art_no = {}
-            all_by_item = {}
-            for _, row in df_all.iterrows():
-                art_no = str(row.get('Art No', '')).strip().lower()
-                item_desc = str(row.get('item', '')).strip().lower()
-                if art_no.endswith('.0'):
-                    art_no = art_no[:-2]
-                if art_no and art_no != 'nan':
-                    all_by_art_no[art_no] = row
-                if item_desc and item_desc != 'nan':
-                    all_by_item[item_desc] = row
+
+            # Insert 'Vendor' column value in between column 'Invoice Date' and 'Invoice Number'
+            if 'Vendor' in df_merge_processed.columns:
+                df_merge_processed.drop(columns=['Vendor'], inplace=True)
+                
+            date_idx = None
+            num_idx = None
+            for i, col in enumerate(df_merge_processed.columns):
+                c_low = str(col).lower().replace(' ', '').replace('_', '').replace('.', '')
+                if c_low in ['invoicedate', 'datum', 'date']:
+                    date_idx = i
+                elif c_low in ['invoicenumber', 'rechnnr', 'docnr', 'invoiceno']:
+                    num_idx = i
                     
+            if date_idx is not None:
+                insert_idx = date_idx + 1
+            elif num_idx is not None:
+                insert_idx = num_idx
+            else:
+                insert_idx = min(2, len(df_merge_processed.columns))
+                
+            df_merge_processed.insert(insert_idx, 'Vendor', None)
+            
             # Identify columns to add after Vat%
             vat_col_name = None
             for col in df_merge_processed.columns:
@@ -408,6 +487,26 @@ class SRProductsArchiveDialog(QDialog):
                 df_merge_processed.insert(current_idx, col, None)
                 current_idx += 1
                 
+            # If unique file, add 3 new columns after Steur: Tag, Kassen, Rack
+            if self.selected_file_type == 'unique':
+                steur_idx = None
+                for i, col in enumerate(df_merge_processed.columns):
+                    if str(col).lower() == 'steur':
+                        steur_idx = i
+                        break
+                if steur_idx is None:
+                    steur_idx = len(df_merge_processed.columns) - 1
+                    
+                cols_to_add_unique = ['Tag', 'Kassen', 'Rack']
+                for col in cols_to_add_unique:
+                    if col in df_merge_processed.columns:
+                        df_merge_processed.drop(columns=[col], inplace=True)
+                        
+                current_idx = steur_idx + 1
+                for col in cols_to_add_unique:
+                    df_merge_processed.insert(current_idx, col, None)
+                    current_idx += 1
+
             # If Name column is not in df_merge_processed, insert it
             if 'Name' not in df_merge_processed.columns:
                 desc_idx = None
@@ -422,11 +521,36 @@ class SRProductsArchiveDialog(QDialog):
                     df_merge_processed.insert(desc_idx + 1, 'Name', None)
                 else:
                     df_merge_processed.insert(0, 'Name', None)
-                    
-            # Convert all columns to object type to prevent strict pandas 2.x/Arrow dtype assignment checks
+
+            # Convert all columns to object type to prevent strict Arrow/pandas 2.x dtype Checks
             for col in df_merge_processed.columns:
                 df_merge_processed[col] = df_merge_processed[col].astype(object)
 
+            # Build dictionaries for fast matching on df_source (checking Vendor + Item/ArtNo)
+            all_by_vendor_art = {}
+            all_by_vendor_item = {}
+            all_by_art_no = {}
+            all_by_item = {}
+            for _, row in df_source.iterrows():
+                art_no = str(row.get('Art No', '')).strip().lower()
+                if art_no.endswith('.0'):
+                    art_no = art_no[:-2]
+                item_desc = str(row.get('item', '')).strip().lower()
+                vendor_val = str(row.get('Vendor', '')).strip().lower()
+                
+                # General fallback maps
+                if art_no and art_no != 'nan':
+                    all_by_art_no[art_no] = row
+                if item_desc and item_desc != 'nan':
+                    all_by_item[item_desc] = row
+                    
+                # Vendor specific maps
+                if vendor_val and vendor_val != 'nan':
+                    if art_no and art_no != 'nan':
+                        all_by_vendor_art[(vendor_val, art_no)] = row
+                    if item_desc and item_desc != 'nan':
+                        all_by_vendor_item[(vendor_val, item_desc)] = row
+                    
             # Cache for Barcode: {artno: {item: Barcode}}
             barcode_cache = {}
             
@@ -434,27 +558,47 @@ class SRProductsArchiveDialog(QDialog):
             for idx in range(len(df_merge_processed)):
                 row_merge = df_merge_processed.iloc[idx]
                 
-                # Get item no and description from merge sheet
+                # Get item no, description, and vendor from merge sheet
                 item_no_val = str(row_merge.get('Item No.', '')).strip().lower()
                 if item_no_val.endswith('.0'):
                     item_no_val = item_no_val[:-2]
                 desc_val = str(row_merge.get('Description', '')).strip().lower()
+                vendor_val = str(row_merge.get('Vendor', '')).strip().lower()
                 
-                # Find match in loaded sheet All
                 matched_row = None
-                if item_no_val and item_no_val != 'nan' and item_no_val in all_by_art_no:
-                    matched_row = all_by_art_no[item_no_val]
-                elif desc_val and desc_val != 'nan' and desc_val in all_by_item:
-                    matched_row = all_by_item[desc_val]
+                
+                # Try vendor-specific matching if vendor_val is populated
+                if vendor_val and vendor_val != 'nan':
+                    if item_no_val and item_no_val != 'nan' and (vendor_val, item_no_val) in all_by_vendor_art:
+                        matched_row = all_by_vendor_art[(vendor_val, item_no_val)]
+                    elif desc_val and desc_val != 'nan' and (vendor_val, desc_val) in all_by_vendor_item:
+                        matched_row = all_by_vendor_item[(vendor_val, desc_val)]
+                        
+                # Fallback to general matching if no vendor match found (or vendor was not specified)
+                if matched_row is None:
+                    if item_no_val and item_no_val != 'nan' and item_no_val in all_by_art_no:
+                        matched_row = all_by_art_no[item_no_val]
+                    elif desc_val and desc_val != 'nan' and desc_val in all_by_item:
+                        matched_row = all_by_item[desc_val]
                     
                 if matched_row is not None:
                     # Modify name column value
                     name_val = matched_row.get('Name')
                     df_merge_processed.at[idx, 'Name'] = name_val
                     
-                    # Copy columns
+                    # Copy Vendor column value
+                    source_vendor = matched_row.get('Vendor')
+                    if pd.notna(source_vendor):
+                        df_merge_processed.at[idx, 'Vendor'] = source_vendor
+                    
+                    # Copy standard columns
                     for col in ['Category', 'Sub-Category', 'Steur', 'unit_price', 'sale_price', 'margin_50', '7 days']:
                         df_merge_processed.at[idx, col] = matched_row.get(col)
+                        
+                    # Copy unique columns if selected file is unique
+                    if self.selected_file_type == 'unique':
+                        for col in ['Tag', 'Kassen', 'Rack']:
+                            df_merge_processed.at[idx, col] = matched_row.get(col)
                         
                     # Barcode logic
                     barcode_val = matched_row.get('Barcode')

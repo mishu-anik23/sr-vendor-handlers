@@ -2,6 +2,7 @@ import sys
 import unittest
 from pathlib import Path
 import pandas as pd
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication
 
 # Ensure path resolution
@@ -276,10 +277,99 @@ class TestApplyStandards(unittest.TestCase):
             if merge_excel_path_existing.exists():
                 merge_excel_path_existing.unlink()
                 
-        # Assert processing succeeded and created 3 sheets without index errors
         self.assertIn('purchase archives', dialog.processed_sheets)
         self.assertIn('unique products', dialog.processed_sheets)
         self.assertIn('Statistics', dialog.processed_sheets)
+
+    def test_dropdown_combobox_filtering(self):
+        from main import CheckableComboBox
+        dialog = SRProductsArchiveDialog(parent=None)
+        dialog.sheets_data = {
+            'unique products': self.df_product_data
+        }
+        dialog._display_sheets(dialog.sheets_data)
+        
+        # Test combobox population
+        self.assertGreater(dialog.brand_filter.model().rowCount(), 0)
+        self.assertGreater(dialog.category_filter.model().rowCount(), 0)
+        self.assertGreater(dialog.subcat_filter.model().rowCount(), 0)
+        
+        # Check brand filter functionality
+        # Set "BrandA" checked
+        brand_item = dialog.brand_filter.model().item(0) # BrandA is first alphabetically
+        brand_item.setCheckState(Qt.Checked)
+        dialog.brand_filter._changed = True
+        dialog.brand_filter.hidePopup() # Emits signal and calls filter_current_tab_table
+        
+        # Verify filtering was applied
+        table = dialog.tab_widget.currentWidget()
+        # Row 0 is BrandA, Row 1 is BrandB, Row 2 is BrandC
+        self.assertFalse(table.isRowHidden(0))
+        self.assertTrue(table.isRowHidden(1))
+        self.assertTrue(table.isRowHidden(2))
+
+    def test_tag_list_dialog_persistence_and_generation(self):
+        import sqlite3
+        from main import TagListDialog
+        
+        # Clean up database if exists from previous runs
+        db_path = Path("sr_product_tags.db")
+        if db_path.exists():
+            try:
+                db_path.unlink()
+            except Exception:
+                pass
+                
+        selected_rows = [
+            {'Name': 'Sample Item 1', 'Barcode': '9310065012300', 'sale_price': '€ 2.50', 'Brand': 'BrandX', 'Category': 'CategoryY'},
+            {'Name': 'Sample Item 2', 'Barcode': '9310065012311', 'sale_price': '€ 4.99', 'Brand': 'BrandZ', 'Category': 'CategoryY'}
+        ]
+        
+        from unittest.mock import patch
+        with patch('main.QMessageBox.information') as mock_info, \
+             patch('main.QMessageBox.warning') as mock_warn:
+             
+            dialog = TagListDialog(selected_rows, parent=None)
+            
+            # 1. Verify UI populated
+            self.assertEqual(dialog.table.rowCount(), 2)
+            self.assertEqual(dialog.table.columnCount(), 5)
+            
+            # 2. Test Process Tag Entries makes editable
+            item = dialog.table.item(0, 0)
+            self.assertFalse(item.flags() & Qt.ItemIsEditable)
+            dialog.process_entries()
+            self.assertTrue(item.flags() & Qt.ItemIsEditable)
+            mock_info.assert_called_once_with(dialog, "Editable Mode", "Table entries are now editable.")
+            mock_info.reset_mock()
+            
+            # 3. Test Save Button (persists to SQLite)
+            dialog.save_entries()
+            self.assertTrue(db_path.exists())
+            mock_info.assert_called_once()
+            mock_info.reset_mock()
+            
+            # Verify db contents
+            conn = sqlite3.connect("sr_product_tags.db")
+            cursor = conn.cursor()
+            cursor.execute("SELECT Name, Barcode, sale_price FROM product_tags")
+            rows = cursor.fetchall()
+            conn.close()
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0][0], 'Sample Item 1')
+            
+            # 4. Test Generate Tag PDF
+            dialog.generate_tags_pdf()
+            self.assertIsNotNone(dialog.generated_pdf_data)
+            self.assertGreater(len(dialog.generated_pdf_data), 0)
+            mock_info.assert_called_once()
+            
+        # Clean up db file
+        if db_path.exists():
+            try:
+                db_path.unlink()
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     unittest.main()

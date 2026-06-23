@@ -4,11 +4,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import io
+import sqlite3
 
 import pandas as pd
 import requests
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QIcon, QPixmap, QImage
+from PyQt5.QtCore import Qt, QEvent
+from PyQt5.QtGui import QIcon, QPixmap, QImage, QStandardItemModel, QStandardItem
 from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
@@ -32,6 +33,7 @@ from PyQt5.QtWidgets import (
     QWidget, QHBoxLayout, QSpinBox, QScrollArea,
     QFileDialog,
     QRadioButton, QButtonGroup, QInputDialog,
+    QStylePainter, QStyleOptionComboBox, QStyle, QListView,
 )
 
 from db_manager import DatabaseManager
@@ -47,6 +49,417 @@ COMPANY_ADDRESS = "Schwarzwald Straße 27, 60528 Frankfurt"
 LOGO_FILE = Path(__file__).resolve().parent / "logo-sr-tmp.jpeg"
 DB_FILE = Path(__file__).resolve().parent / "data" / "vendor_app.db"
 VENDOR_ROOT = Path(__file__).resolve().parent / "data" / "vendors"
+
+
+class CheckableComboBox(QComboBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setView(QListView(self))
+        self.view().pressed.connect(self.handle_item_pressed)
+        self.setModel(QStandardItemModel(self))
+        self.view().viewport().installEventFilter(self)
+        self._changed = False
+
+    def eventFilter(self, widget, event):
+        if widget == self.view().viewport() and event.type() == QEvent.MouseButtonRelease:
+            index = self.view().indexAt(event.pos())
+            item = self.model().itemFromIndex(index)
+            if item is not None:
+                item.setCheckState(Qt.Checked if item.checkState() == Qt.Unchecked else Qt.Unchecked)
+            self._changed = True
+            return True
+        return super().eventFilter(widget, event)
+
+    def handle_item_pressed(self, index):
+        self._changed = True
+
+    def hidePopup(self):
+        if self._changed:
+            self._changed = False
+            self.currentTextChanged.emit(self.currentText())
+        super().hidePopup()
+
+    def add_items(self, items):
+        self.clear()
+        for text in items:
+            item = QStandardItem(text)
+            item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            item.setData(Qt.Unchecked, Qt.CheckStateRole)
+            self.model().appendRow(item)
+
+    def checked_items(self):
+        checked = []
+        for i in range(self.model().rowCount()):
+            item = self.model().item(i)
+            if item and item.checkState() == Qt.Checked:
+                checked.append(item.text())
+        return checked
+
+    def paintEvent(self, event):
+        painter = QStylePainter(self)
+        painter.setFont(self.font())
+        opt = QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        checked = self.checked_items()
+        if not checked:
+            opt.currentText = "All"
+        else:
+            opt.currentText = ", ".join(checked)
+        painter.drawComplexControl(QStyle.CC_ComboBox, opt)
+        painter.drawControl(QStyle.CE_ComboBoxLabel, opt)
+
+
+class TagListDialog(QDialog):
+    def __init__(self, selected_rows, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Tag List Manager")
+        self.setMinimumSize(1000, 700)
+        self.selected_rows = selected_rows  # List of dicts
+        self.generated_pdf_data = None
+        self.logo_path = Path(__file__).resolve().parent / "logo-sr-tmp.jpeg"
+        self._build_ui()
+        self.load_saved_tags()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        self.header_label = QLabel(f"Selected Rows for Tag Generation ({len(self.selected_rows)} selected)")
+        self.header_label.setStyleSheet("font-size: 12pt; font-weight: bold;")
+        layout.addWidget(self.header_label)
+
+        self.table = QTableWidget()
+        self.columns = []
+        if self.selected_rows:
+            self.columns = list(self.selected_rows[0].keys())
+        self.table.setColumnCount(len(self.columns))
+        self.table.setHorizontalHeaderLabels(self.columns)
+        self.table.setRowCount(len(self.selected_rows))
+
+        for r_idx, row_data in enumerate(self.selected_rows):
+            for c_idx, col_name in enumerate(self.columns):
+                val = str(row_data.get(col_name, ''))
+                item = QTableWidgetItem(val)
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)  # non-editable
+                self.table.setItem(r_idx, c_idx, item)
+
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        layout.addWidget(self.table)
+
+        controls_layout = QHBoxLayout()
+
+        self.process_btn = QPushButton("Process Tag Entries")
+        self.process_btn.setStyleSheet("background-color: #ffc107; color: black; font-weight: bold; padding: 6px;")
+        self.process_btn.clicked.connect(self.process_entries)
+        controls_layout.addWidget(self.process_btn)
+
+        self.save_btn = QPushButton("Save")
+        self.save_btn.setStyleSheet("background-color: #28a745; color: white; font-weight: bold; padding: 6px;")
+        self.save_btn.clicked.connect(self.save_entries)
+        controls_layout.addWidget(self.save_btn)
+
+        self.generate_btn = QPushButton("Generate Tag")
+        self.generate_btn.setStyleSheet("background-color: #17a2b8; color: white; font-weight: bold; padding: 6px;")
+        self.generate_btn.clicked.connect(self.generate_tags_pdf)
+        controls_layout.addWidget(self.generate_btn)
+
+        self.download_pdf_btn = QPushButton("Download Generated Tags")
+        self.download_pdf_btn.setStyleSheet("background-color: #6c757d; color: white; font-weight: bold; padding: 6px;")
+        self.download_pdf_btn.setEnabled(False)
+        self.download_pdf_btn.clicked.connect(self.download_tags_pdf)
+        controls_layout.addWidget(self.download_pdf_btn)
+
+        layout.addLayout(controls_layout)
+
+        self.preview_tab_widget = QTabWidget()
+
+        self.db_tab = QWidget()
+        db_tab_layout = QVBoxLayout(self.db_tab)
+        self.db_table = QTableWidget()
+        db_tab_layout.addWidget(self.db_table)
+        self.preview_tab_widget.addTab(self.db_tab, "Saved Tag Rows")
+
+        self.pdf_tab = QWidget()
+        pdf_tab_layout = QVBoxLayout(self.pdf_tab)
+        self.pdf_scroll = QScrollArea()
+        self.pdf_scroll.setWidgetResizable(True)
+        self.pdf_preview_container = QWidget()
+        self.pdf_preview_layout = QVBoxLayout(self.pdf_preview_container)
+        self.pdf_scroll.setWidget(self.pdf_preview_container)
+        pdf_tab_layout.addWidget(self.pdf_scroll)
+        self.preview_tab_widget.addTab(self.pdf_tab, "Generated PDF Preview")
+
+        layout.addWidget(self.preview_tab_widget)
+
+    def process_entries(self):
+        for r in range(self.table.rowCount()):
+            for c in range(self.table.columnCount()):
+                item = self.table.item(r, c)
+                if item:
+                    item.setFlags(item.flags() | Qt.ItemIsEditable)
+        QMessageBox.information(self, "Editable Mode", "Table entries are now editable.")
+
+    def save_entries(self):
+        rows_data = []
+        for r in range(self.table.rowCount()):
+            row_vals = []
+            for c in range(self.table.columnCount()):
+                item = self.table.item(r, c)
+                row_vals.append(item.text().strip() if item else "")
+            rows_data.append(row_vals)
+
+        if not rows_data:
+            QMessageBox.warning(self, "No Data", "No rows to save.")
+            return
+
+        try:
+            conn = sqlite3.connect("sr_product_tags.db")
+            cursor = conn.cursor()
+            col_defs = ", ".join([f"`{col}` TEXT" for col in self.columns])
+            create_sql = f"CREATE TABLE IF NOT EXISTS product_tags (id INTEGER PRIMARY KEY AUTOINCREMENT, {col_defs}, saved_time TEXT)"
+            cursor.execute(create_sql)
+
+            saved_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            placeholders = ", ".join(["?"] * (len(self.columns) + 1))
+            insert_cols = ", ".join([f"`{col}`" for col in self.columns]) + ", saved_time"
+            insert_sql = f"INSERT INTO product_tags ({insert_cols}) VALUES ({placeholders})"
+
+            for row in rows_data:
+                val_list = list(row) + [saved_time]
+                cursor.execute(insert_sql, val_list)
+
+            conn.commit()
+            conn.close()
+
+            QMessageBox.information(self, "Success", "Selected entries saved to 'sr_product_tags' SQLite DB successfully.")
+            self.load_saved_tags()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save entries to SQLite:\n{str(e)}")
+
+    def load_saved_tags(self):
+        try:
+            conn = sqlite3.connect("sr_product_tags.db")
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='product_tags'")
+            if not cursor.fetchone():
+                conn.close()
+                self.db_table.setColumnCount(0)
+                self.db_table.setRowCount(0)
+                return
+
+            cursor.execute("SELECT * FROM product_tags ORDER BY id DESC")
+            rows = cursor.fetchall()
+            colnames = [description[0] for description in cursor.description]
+            conn.close()
+
+            self.db_table.setColumnCount(len(colnames))
+            self.db_table.setHorizontalHeaderLabels(colnames)
+            self.db_table.setRowCount(len(rows))
+
+            for r_idx, row in enumerate(rows):
+                for c_idx, val in enumerate(row):
+                    self.db_table.setItem(r_idx, c_idx, QTableWidgetItem(str(val) if val is not None else ""))
+            self.db_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        except Exception as e:
+            print(f"Error loading saved tags: {e}")
+
+    def generate_tags_pdf(self):
+        products = []
+        for r in range(self.table.rowCount()):
+            row_data = {}
+            for c_idx, col_name in enumerate(self.columns):
+                item = self.table.item(r, c_idx)
+                row_data[col_name] = item.text().strip() if item else ""
+            products.append(row_data)
+
+        if not products:
+            QMessageBox.warning(self, "No Products", "No product rows found to generate tags.")
+            return
+
+        try:
+            import tempfile
+            import os
+            temp_pdf = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+            temp_pdf.close()
+            pdf_path = temp_pdf.name
+
+            from reportlab.pdfgen import canvas
+            from reportlab.lib.pagesizes import A4
+            from reportlab.graphics.barcode import createBarcodeDrawing
+
+            c = canvas.Canvas(pdf_path, pagesize=A4)
+
+            tag_width = 180
+            tag_height = 95
+            margin_x = 20
+            margin_y = 30
+            gap_x = 10
+            gap_y = 10
+
+            total_tags = len(products)
+            tags_per_page = 24
+            date_str = datetime.now().strftime("%Y-%m-%d")
+
+            for idx, product in enumerate(products):
+                page_idx = idx % tags_per_page
+                if idx > 0 and page_idx == 0:
+                    c.showPage()
+
+                col = page_idx % 3
+                row = page_idx // 3
+
+                x = margin_x + col * (tag_width + gap_x)
+                y = 841.89 - margin_y - (row + 1) * tag_height - row * gap_y
+
+                c.setStrokeColorRGB(0.7, 0.7, 0.7)
+                c.setLineWidth(0.5)
+                c.rect(x, y, tag_width, tag_height)
+
+                if self.logo_path.exists():
+                    try:
+                        c.drawImage(str(self.logo_path), x + 5, y + tag_height - 25, width=35, height=20, preserveAspectRatio=True)
+                    except Exception as e:
+                        print(f"Error drawing logo in PDF: {e}")
+
+                c.setFont("Helvetica", 6)
+                c.setFillColorRGB(0.4, 0.4, 0.4)
+                c.drawRightString(x + tag_width - 5, y + tag_height - 12, f"Date: {date_str}")
+
+                c.setFont("Helvetica-Bold", 8)
+                c.setFillColorRGB(0, 0, 0)
+                name_str = product.get('Name', product.get('product_name', product.get('Description', '')))
+
+                words = name_str.split()
+                lines = []
+                current_line = ""
+                for w in words:
+                    if c.stringWidth(current_line + " " + w, "Helvetica-Bold", 8) < 170:
+                        current_line += (" " if current_line else "") + w
+                    else:
+                        lines.append(current_line)
+                        current_line = w
+                if current_line:
+                    lines.append(current_line)
+
+                y_offset = y + tag_height - 35
+                for line in lines[:2]:
+                    c.drawString(x + 5, y_offset, line)
+                    y_offset -= 10
+
+                price_val = ""
+                for k in ['sale_price', 'Sale price', 'sale price', 'Price']:
+                    if k in product:
+                        price_val = product[k]
+                        break
+                if not price_val:
+                    for col_name in product.keys():
+                        if 'price' in col_name.lower():
+                            price_val = product[col_name]
+                            break
+
+                try:
+                    cleaned_price = re.sub(r'[^\d.]', '', str(price_val))
+                    if cleaned_price:
+                        price_display = f"€ {float(cleaned_price):.2f}"
+                    else:
+                        price_display = str(price_val)
+                except Exception:
+                    price_display = str(price_val)
+
+                c.setFont("Helvetica-Bold", 20)
+                c.drawRightString(x + tag_width - 5, y + 25, price_display)
+
+                barcode_val = ""
+                for k in ['Barcode', 'barcode', 'APC', 'Art No', 'Item No.']:
+                    if k in product and product[k] and str(product[k]).lower() != 'nan':
+                        barcode_val = str(product[k]).strip()
+                        break
+
+                if barcode_val:
+                    digits_only = re.sub(r'\D', '', barcode_val)
+                    drawing = None
+                    for b_type in ['EAN13', 'Code128']:
+                        if b_type == 'EAN13' and len(digits_only) != 13:
+                            continue
+                        try:
+                            drawing = createBarcodeDrawing(b_type, value=digits_only if b_type == 'EAN13' else barcode_val,
+                                                           barHeight=20, barWidth=0.8, humanReadable=True)
+                            break
+                        except Exception:
+                            continue
+                    if drawing:
+                        drawing.drawOn(c, x + 5, y + 5)
+                    else:
+                        c.setFont("Helvetica", 7)
+                        c.drawString(x + 5, y + 8, f"BC: {barcode_val}")
+
+            c.showPage()
+            c.save()
+
+            with open(pdf_path, "rb") as f:
+                self.generated_pdf_data = f.read()
+
+            try:
+                os.unlink(pdf_path)
+            except Exception:
+                pass
+
+            self.download_pdf_btn.setEnabled(True)
+            QMessageBox.information(self, "Success", "Supermarket tags generated successfully. Check the PDF Preview tab.")
+
+            self.preview_tab_widget.setCurrentIndex(1)
+            self.render_pdf_preview()
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(self, "Error", f"Failed to generate tags PDF:\n{str(e)}")
+
+    def render_pdf_preview(self):
+        import io
+        while self.pdf_preview_layout.count():
+            item = self.pdf_preview_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if not self.generated_pdf_data:
+            return
+
+        try:
+            import pypdfium2 as pdfium
+            doc = pdfium.PdfDocument(self.generated_pdf_data)
+            for page_idx in range(len(doc)):
+                page = doc[page_idx]
+                bitmap = page.render(scale=2)
+                pil_img = bitmap.to_pil()
+
+                im_data = io.BytesIO()
+                pil_img.save(im_data, format='PNG')
+                qimg = QImage.fromData(im_data.getvalue())
+
+                lbl = QLabel()
+                lbl.setPixmap(QPixmap.fromImage(qimg))
+                lbl.setAlignment(Qt.AlignCenter)
+                lbl.setStyleSheet("border: 1px solid #ccc; margin: 10px; background-color: white;")
+                self.pdf_preview_layout.addWidget(lbl)
+        except Exception as e:
+            print(f"Error rendering PDF preview: {e}")
+            lbl = QLabel(f"Failed to render preview:\n{str(e)}")
+            self.pdf_preview_layout.addWidget(lbl)
+
+    def download_tags_pdf(self):
+        if not self.generated_pdf_data:
+            QMessageBox.warning(self, "Error", "No generated PDF data to save.")
+            return
+
+        options = QFileDialog.Options()
+        file_name, _ = QFileDialog.getSaveFileName(self, "Save Tags PDF", "sunrise_tags.pdf", "PDF Files (*.pdf)", options=options)
+        if file_name:
+            try:
+                with open(file_name, "wb") as f:
+                    f.write(self.generated_pdf_data)
+                QMessageBox.information(self, "Success", "Tags PDF saved successfully.")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to save PDF file:\n{str(e)}")
 
 
 class SRProductsArchiveDialog(QDialog):
@@ -119,6 +532,12 @@ class SRProductsArchiveDialog(QDialog):
         self.download_btn.setVisible(False)
         url_layout.addWidget(self.download_btn)
 
+        self.view_tag_list_btn = QPushButton("View Tag List")
+        self.view_tag_list_btn.setStyleSheet("background-color: #007bff; color: white; font-weight: bold;")
+        self.view_tag_list_btn.clicked.connect(self.view_tag_list)
+        self.view_tag_list_btn.setVisible(False)
+        url_layout.addWidget(self.view_tag_list_btn)
+
         layout.addLayout(url_layout)
 
         # Main splitter (vertical)
@@ -138,9 +557,55 @@ class SRProductsArchiveDialog(QDialog):
         self.tab_search_input.textChanged.connect(self.filter_current_tab_table)
         filter_layout.addWidget(self.tab_search_input)
         upper_layout.addLayout(filter_layout)
+
+        # Checkable Dropdown Filters Layout
+        dropdown_layout = QHBoxLayout()
+        self.brand_filter_label = QLabel("<b>Brand:</b>")
+        self.brand_filter = CheckableComboBox()
+        self.brand_filter.currentTextChanged.connect(self.filter_current_tab_table)
+        
+        self.category_filter_label = QLabel("<b>Category:</b>")
+        self.category_filter = CheckableComboBox()
+        self.category_filter.currentTextChanged.connect(self.filter_current_tab_table)
+        
+        self.subcat_filter_label = QLabel("<b>Sub-Category:</b>")
+        self.subcat_filter = CheckableComboBox()
+        self.subcat_filter.currentTextChanged.connect(self.filter_current_tab_table)
+        
+        self.vendor_filter_label = QLabel("<b>Vendor:</b>")
+        self.vendor_filter = CheckableComboBox()
+        self.vendor_filter.currentTextChanged.connect(self.filter_current_tab_table)
+        
+        self.date_filter_label = QLabel("<b>Invoice Date:</b>")
+        self.date_filter = CheckableComboBox()
+        self.date_filter.currentTextChanged.connect(self.filter_current_tab_table)
+        
+        dropdown_layout.addWidget(self.brand_filter_label)
+        dropdown_layout.addWidget(self.brand_filter)
+        dropdown_layout.addWidget(self.category_filter_label)
+        dropdown_layout.addWidget(self.category_filter)
+        dropdown_layout.addWidget(self.subcat_filter_label)
+        dropdown_layout.addWidget(self.subcat_filter)
+        dropdown_layout.addWidget(self.vendor_filter_label)
+        dropdown_layout.addWidget(self.vendor_filter)
+        dropdown_layout.addWidget(self.date_filter_label)
+        dropdown_layout.addWidget(self.date_filter)
+        upper_layout.addLayout(dropdown_layout)
+        
+        # Hide filters by default
+        self.brand_filter_label.setVisible(False)
+        self.brand_filter.setVisible(False)
+        self.category_filter_label.setVisible(False)
+        self.category_filter.setVisible(False)
+        self.subcat_filter_label.setVisible(False)
+        self.subcat_filter.setVisible(False)
+        self.vendor_filter_label.setVisible(False)
+        self.vendor_filter.setVisible(False)
+        self.date_filter_label.setVisible(False)
+        self.date_filter.setVisible(False)
         
         self.tab_widget = QTabWidget()
-        self.tab_widget.currentChanged.connect(self.filter_current_tab_table)
+        self.tab_widget.currentChanged.connect(self.on_tab_changed)
         upper_layout.addWidget(self.tab_widget)
         
         self.main_splitter.addWidget(self.upper_container)
@@ -231,18 +696,243 @@ class SRProductsArchiveDialog(QDialog):
     def filter_current_tab_table(self) -> None:
         query = self.tab_search_input.text().strip().lower()
         current_table = self.tab_widget.currentWidget()
-        if isinstance(current_table, QTableWidget):
-            for row in range(current_table.rowCount()):
-                if not query:
-                    current_table.setRowHidden(row, False)
-                    continue
-                match = False
+        if not isinstance(current_table, QTableWidget):
+            return
+
+        # Get active filters
+        selected_brands = self.brand_filter.checked_items() if hasattr(self, 'brand_filter') else []
+        selected_categories = self.category_filter.checked_items() if hasattr(self, 'category_filter') else []
+        selected_subcats = self.subcat_filter.checked_items() if hasattr(self, 'subcat_filter') else []
+        selected_vendors = self.vendor_filter.checked_items() if hasattr(self, 'vendor_filter') else []
+        selected_dates = self.date_filter.checked_items() if hasattr(self, 'date_filter') else []
+
+        # Get column indices
+        brand_col = -1
+        cat_col = -1
+        subcat_col = -1
+        vendor_col = -1
+        date_col = -1
+        for col_idx in range(current_table.columnCount()):
+            header = current_table.horizontalHeaderItem(col_idx)
+            if header:
+                header_text = header.text().strip().lower().replace(' ', '').replace('_', '').replace('-', '')
+                if header_text == 'brand':
+                    brand_col = col_idx
+                elif header_text == 'category':
+                    cat_col = col_idx
+                elif header_text in ['subcategory', 'subcat']:
+                    subcat_col = col_idx
+                elif header_text in ['vendor', 'vendorname']:
+                    vendor_col = col_idx
+                elif header_text in ['invoicedate', 'date', 'datum']:
+                    date_col = col_idx
+
+        # Hide or show filters depending on whether the columns exist in current table
+        if hasattr(self, 'brand_filter'):
+            has_brand = (brand_col != -1)
+            self.brand_filter.setVisible(has_brand)
+            self.brand_filter_label.setVisible(has_brand)
+
+            has_cat = (cat_col != -1)
+            self.category_filter.setVisible(has_cat)
+            self.category_filter_label.setVisible(has_cat)
+
+            has_subcat = (subcat_col != -1)
+            self.subcat_filter.setVisible(has_subcat)
+            self.subcat_filter_label.setVisible(has_subcat)
+
+            has_vendor = (vendor_col != -1)
+            self.vendor_filter.setVisible(has_vendor)
+            self.vendor_filter_label.setVisible(has_vendor)
+
+            has_date = (date_col != -1)
+            self.date_filter.setVisible(has_date)
+            self.date_filter_label.setVisible(has_date)
+
+        for row in range(current_table.rowCount()):
+            # 1. Text Search Filter
+            text_match = False
+            if not query:
+                text_match = True
+            else:
                 for col in range(current_table.columnCount()):
+                    header = current_table.horizontalHeaderItem(col)
+                    if header and header.text() == 'In Tag Bucket':
+                        continue
                     item = current_table.item(row, col)
                     if item and query in item.text().lower():
-                        match = True
+                        text_match = True
                         break
-                current_table.setRowHidden(row, not match)
+
+            # 2. Brand Filter
+            brand_match = True
+            if selected_brands and brand_col != -1:
+                item = current_table.item(row, brand_col)
+                val = item.text().strip() if item else ""
+                brand_match = (val in selected_brands)
+
+            # 3. Category Filter
+            cat_match = True
+            if selected_categories and cat_col != -1:
+                item = current_table.item(row, cat_col)
+                val = item.text().strip() if item else ""
+                cat_match = (val in selected_categories)
+
+            # 4. Sub-Category Filter
+            subcat_match = True
+            if selected_subcats and subcat_col != -1:
+                item = current_table.item(row, subcat_col)
+                val = item.text().strip() if item else ""
+                subcat_match = (val in selected_subcats)
+
+            # 5. Vendor Filter
+            vendor_match = True
+            if selected_vendors and vendor_col != -1:
+                item = current_table.item(row, vendor_col)
+                val = item.text().strip() if item else ""
+                vendor_match = (val in selected_vendors)
+
+            # 6. Invoice Date Filter
+            date_match = True
+            if selected_dates and date_col != -1:
+                item = current_table.item(row, date_col)
+                val = item.text().strip() if item else ""
+                date_match = (val in selected_dates)
+
+            # Show row only if all conditions match
+            current_table.setRowHidden(row, not (text_match and brand_match and cat_match and subcat_match and vendor_match and date_match))
+
+    def on_tab_changed(self, index) -> None:
+        self.populate_dropdown_filters()
+        self.filter_current_tab_table()
+
+    def populate_dropdown_filters(self) -> None:
+        current_table = self.tab_widget.currentWidget()
+        if not isinstance(current_table, QTableWidget):
+            return
+
+        self.brand_filter.blockSignals(True)
+        self.category_filter.blockSignals(True)
+        self.subcat_filter.blockSignals(True)
+        self.vendor_filter.blockSignals(True)
+        self.date_filter.blockSignals(True)
+
+        brand_col = -1
+        cat_col = -1
+        subcat_col = -1
+        vendor_col = -1
+        date_col = -1
+        for col_idx in range(current_table.columnCount()):
+            header = current_table.horizontalHeaderItem(col_idx)
+            if header:
+                header_text = header.text().strip().lower().replace(' ', '').replace('_', '').replace('-', '')
+                if header_text == 'brand':
+                    brand_col = col_idx
+                elif header_text == 'category':
+                    cat_col = col_idx
+                elif header_text in ['subcategory', 'subcat']:
+                    subcat_col = col_idx
+                elif header_text in ['vendor', 'vendorname']:
+                    vendor_col = col_idx
+                elif header_text in ['invoicedate', 'date', 'datum']:
+                    date_col = col_idx
+
+        brands = set()
+        categories = set()
+        subcats = set()
+        vendors = set()
+        dates = set()
+
+        for row in range(current_table.rowCount()):
+            if brand_col != -1:
+                item = current_table.item(row, brand_col)
+                if item and item.text().strip():
+                    brands.add(item.text().strip())
+            if cat_col != -1:
+                item = current_table.item(row, cat_col)
+                if item and item.text().strip():
+                    categories.add(item.text().strip())
+            if subcat_col != -1:
+                item = current_table.item(row, subcat_col)
+                if item and item.text().strip():
+                    subcats.add(item.text().strip())
+            if vendor_col != -1:
+                item = current_table.item(row, vendor_col)
+                if item and item.text().strip():
+                    vendors.add(item.text().strip())
+            if date_col != -1:
+                item = current_table.item(row, date_col)
+                if item and item.text().strip():
+                    dates.add(item.text().strip())
+
+        if brand_col != -1:
+            self.brand_filter.add_items(sorted(list(brands)))
+        else:
+            self.brand_filter.clear()
+
+        if cat_col != -1:
+            self.category_filter.add_items(sorted(list(categories)))
+        else:
+            self.category_filter.clear()
+
+        if subcat_col != -1:
+            self.subcat_filter.add_items(sorted(list(subcats)))
+        else:
+            self.subcat_filter.clear()
+
+        if vendor_col != -1:
+            self.vendor_filter.add_items(sorted(list(vendors)))
+        else:
+            self.vendor_filter.clear()
+
+        if date_col != -1:
+            self.date_filter.add_items(sorted(list(dates)))
+        else:
+            self.date_filter.clear()
+
+        self.brand_filter.blockSignals(False)
+        self.category_filter.blockSignals(False)
+        self.subcat_filter.blockSignals(False)
+        self.vendor_filter.blockSignals(False)
+        self.date_filter.blockSignals(False)
+
+    def view_tag_list(self) -> None:
+        current_table = self.tab_widget.currentWidget()
+        if not isinstance(current_table, QTableWidget):
+            QMessageBox.warning(self, "Error", "No active sheet table found.")
+            return
+
+        chk_col = -1
+        for col in range(current_table.columnCount()):
+            header = current_table.horizontalHeaderItem(col)
+            if header and header.text() == 'In Tag Bucket':
+                chk_col = col
+                break
+
+        if chk_col == -1:
+            QMessageBox.warning(self, "Error", "The active sheet does not support row selection ('In Tag Bucket' column not found).")
+            return
+
+        selected_rows = []
+        for row in range(current_table.rowCount()):
+            item = current_table.item(row, chk_col)
+            if item and item.checkState() == Qt.Checked:
+                row_data = {}
+                for col in range(current_table.columnCount()):
+                    if col == chk_col:
+                        continue
+                    h_item = current_table.horizontalHeaderItem(col)
+                    header_name = h_item.text() if h_item else f"Col_{col}"
+                    cell_item = current_table.item(row, col)
+                    row_data[header_name] = cell_item.text() if cell_item else ""
+                selected_rows.append(row_data)
+
+        if not selected_rows:
+            QMessageBox.warning(self, "No Selection", "Please select at least one product in the 'In Tag Bucket' column.")
+            return
+
+        dialog = TagListDialog(selected_rows, self)
+        dialog.exec_()
 
     def auto_load_default_session(self) -> None:
         default_file = self.cache_dir / "default_session.xlsx"
@@ -268,6 +958,7 @@ class SRProductsArchiveDialog(QDialog):
                 self.main_splitter.setVisible(True)
                 self.main_splitter.setSizes([350, 350])
                 self.download_btn.setVisible(False)
+                self.view_tag_list_btn.setVisible(False)
                 self.save_version_btn.setVisible(True)
             except Exception as e:
                 self.status_label.setText(f"Error auto-loading default session: {e}")
@@ -456,6 +1147,7 @@ class SRProductsArchiveDialog(QDialog):
                 self.main_splitter.setVisible(True)
                 self.main_splitter.setSizes([350, 350])
                 self.download_btn.setVisible(False)
+                self.view_tag_list_btn.setVisible(False)
                 self.save_version_btn.setVisible(True)
                 
             except Exception as e:
@@ -565,6 +1257,7 @@ class SRProductsArchiveDialog(QDialog):
             self.main_splitter.setVisible(True)
             self.main_splitter.setSizes([350, 350])
             self.download_btn.setVisible(False)
+            self.view_tag_list_btn.setVisible(False)
             self.save_version_btn.setVisible(True)
             
         except Exception as e:
@@ -578,36 +1271,54 @@ class SRProductsArchiveDialog(QDialog):
         for sheet_name, df in display_data.items():
             # Create table for this sheet
             table = QTableWidget()
-            table.setColumnCount(len(df.columns))
+            is_unique_products = (sheet_name == 'unique products')
+            extra_cols = 1 if is_unique_products else 0
+            
+            table.setColumnCount(len(df.columns) + extra_cols)
             table.setRowCount(len(df))
-            table.setHorizontalHeaderLabels([str(col) for col in df.columns])
+            
+            headers = []
+            if is_unique_products:
+                headers.append('In Tag Bucket')
+            headers.extend([str(col) for col in df.columns])
+            table.setHorizontalHeaderLabels(headers)
             
             # Use interactive resize mode so it is readable if many columns
-            if len(df.columns) > 8:
+            if (len(df.columns) + extra_cols) > 8:
                 table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
             else:
                 table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
             
             # Fill table with data
             for row_idx, (_, row_data) in enumerate(df.iterrows()):
+                if is_unique_products:
+                    chk_item = QTableWidgetItem()
+                    chk_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                    chk_item.setCheckState(Qt.Unchecked)
+                    table.setItem(row_idx, 0, chk_item)
+                    
                 for col_idx, value in enumerate(row_data):
                     val_str = str(value) if value is not None and str(value) != 'nan' else ''
                     item = QTableWidgetItem(val_str)
                     if val_str:
                         item.setToolTip(val_str)
-                    table.setItem(row_idx, col_idx, item)
+                    table.setItem(row_idx, col_idx + extra_cols, item)
             
+            if is_unique_products:
+                table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
+                table.setColumnWidth(0, 100)
+                
             # Set specific column widths for Item, Name, and Description
             for col_idx, col in enumerate(df.columns):
                 c_name = str(col).lower().replace(' ', '').replace('_', '')
                 if c_name in ['item', 'name', 'description']:
-                    table.horizontalHeader().setSectionResizeMode(col_idx, QHeaderView.Interactive)
-                    table.setColumnWidth(col_idx, 350)
+                    table.horizontalHeader().setSectionResizeMode(col_idx + extra_cols, QHeaderView.Interactive)
+                    table.setColumnWidth(col_idx + extra_cols, 350)
             
             # Add table to tab widget
             self.tab_widget.addTab(table, sheet_name)
             
-        self.filter_current_tab_table()
+        self.on_tab_changed(self.tab_widget.currentIndex())
 
     def apply_sunrise_standard(self) -> None:
         if not self.raw_excel_content:
@@ -1073,6 +1784,12 @@ class SRProductsArchiveDialog(QDialog):
             self.status_label.setText("Successfully applied standards. Displaying sheets.")
             self.download_btn.setVisible(True)
             self.download_btn.setEnabled(True)
+            
+            if self.selected_file_type == 'unique':
+                self.view_tag_list_btn.setVisible(True)
+                self.view_tag_list_btn.setEnabled(True)
+            else:
+                self.view_tag_list_btn.setVisible(False)
             
         except Exception as e:
             import traceback

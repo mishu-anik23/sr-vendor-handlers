@@ -275,6 +275,17 @@ class TagListDialog(QDialog):
             QMessageBox.warning(self, "No Products", "No product rows found to generate tags.")
             return
 
+        import sqlite3
+        brands_list = []
+        try:
+            conn = sqlite3.connect("sr_retail_brands.db")
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM brands ORDER BY LENGTH(name) DESC, name ASC")
+            brands_list = [row[0] for row in cursor.fetchall()]
+            conn.close()
+        except Exception as e:
+            print(f"Error loading brands in generate_tags_pdf: {e}")
+
         try:
             import tempfile
             import os
@@ -319,6 +330,27 @@ class TagListDialog(QDialog):
                         c.drawImage(str(self.logo_path), x + 5, y + tag_height - 25, width=35, height=20, preserveAspectRatio=True)
                     except Exception as e:
                         print(f"Error drawing logo in PDF: {e}")
+
+                brand_val = ""
+                for k in ['Brand', 'brand']:
+                    if k in product and product[k] and str(product[k]).lower() != 'nan':
+                        brand_val = str(product[k]).strip()
+                        break
+
+                name_str = product.get('Name', product.get('product_name', product.get('Description', '')))
+                if not brand_val and name_str:
+                    name_upper = name_str.upper()
+                    for b_name in brands_list:
+                        pattern = r'\b' + re.escape(b_name.upper()) + r'\b'
+                        if re.search(pattern, name_upper):
+                            brand_val = b_name
+                            break
+
+                if brand_val:
+                    c.setFont("Helvetica-Bold", 8)
+                    c.setFillColorRGB(0.2, 0.2, 0.2)
+                    brand_x = x + 45 if self.logo_path.exists() else x + 5
+                    c.drawString(brand_x, y + tag_height - 12, brand_val.upper())
 
                 c.setFont("Helvetica", 6)
                 c.setFillColorRGB(0.4, 0.4, 0.4)

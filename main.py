@@ -462,6 +462,285 @@ class TagListDialog(QDialog):
                 QMessageBox.critical(self, "Error", f"Failed to save PDF file:\n{str(e)}")
 
 
+def init_brand_db():
+    db_path = Path("sr_retail_brands.db")
+    conn = sqlite3.connect(str(db_path))
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS brands (
+            id INTEGER PRIMARY KEY,
+            name TEXT UNIQUE NOT NULL,
+            logo_path TEXT,
+            origin TEXT
+        )
+    """)
+    conn.commit()
+    
+    cursor.execute("SELECT COUNT(*) FROM brands")
+    count = cursor.fetchone()[0]
+    if count == 0:
+        try:
+            import sys
+            from importlib.machinery import SourceFileLoader
+            sku_gen_path = Path(__file__).resolve().parent / "sr-sku-gen.py"
+            if sku_gen_path.exists():
+                sku_gen_mod = SourceFileLoader("sr_sku_gen", str(sku_gen_path)).load_module()
+                brand_map = getattr(sku_gen_mod, "BRAND_MAP", {})
+                for k, v in brand_map.items():
+                    try:
+                        b_id = int(k)
+                        b_name = str(v).strip().upper()
+                        cursor.execute("INSERT OR IGNORE INTO brands (id, name) VALUES (?, ?)", (b_id, b_name))
+                    except Exception as ex:
+                        print(f"Error inserting brand {k}: {ex}")
+                conn.commit()
+        except Exception as e:
+            print(f"Error loading BRAND_MAP dynamically: {e}")
+    conn.close()
+
+
+def normalize_description_to_name(desc_str: str) -> str:
+    if not desc_str:
+        return ""
+    desc_str = str(desc_str).strip()
+    pattern = r'\b\d+\s*[xX*]\s*(\d+(?:\.\d+)?)\s*(kg|g|l|ml|pcs|piece|pieces|oz|lbs)\b'
+    
+    def repl(match):
+        val = match.group(1)
+        unit = match.group(2).upper()
+        if unit.endswith('S'):
+            unit = unit[:-1]
+        return f"{val} {unit}"
+        
+    normalized = re.sub(pattern, repl, desc_str, flags=re.IGNORECASE)
+    return normalized
+
+
+def extract_brand_from_desc(desc_str: str, brands_list: list) -> str:
+    if not desc_str:
+        return ""
+    desc_upper = str(desc_str).upper()
+    for _, b_name, _, _ in brands_list:
+        b_name_upper = str(b_name).strip().upper()
+        pattern = r'\b' + re.escape(b_name_upper) + r'\b'
+        if re.search(pattern, desc_upper):
+            return b_name_upper
+    return ""
+
+
+class ShopfloorBrandsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Shopfloor Retail Brands")
+        self.setMinimumSize(950, 600)
+        self.db_path = Path("sr_retail_brands.db")
+        self._build_ui()
+        self.load_brands()
+
+    def _build_ui(self):
+        layout = QHBoxLayout(self)
+
+        # Left Column - Brands Table
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        
+        left_layout.addWidget(QLabel("<b>Brands List (from DB)</b>"))
+        
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["ID", "Brand Name", "Logo Path", "Origin"])
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.itemSelectionChanged.connect(self.on_row_selected)
+        left_layout.addWidget(self.table)
+        
+        layout.addWidget(left_widget, 2)
+
+        # Right Column - Editor Form
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+
+        editor_group = QGroupBox("Brand Details Editor")
+        form_layout = QFormLayout(editor_group)
+
+        self.id_label = QLabel("Auto-Generated (New)")
+        self.id_label.setStyleSheet("font-weight: bold; color: #007bff;")
+        form_layout.addRow("Brand ID:", self.id_label)
+
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("e.g. AASHIRVAAD")
+        form_layout.addRow("Brand Name:", self.name_input)
+
+        logo_layout = QHBoxLayout()
+        self.logo_path_input = QLineEdit()
+        self.logo_path_input.setPlaceholderText("logo_path/file.png")
+        logo_layout.addWidget(self.logo_path_input)
+        
+        self.browse_btn = QPushButton("Browse...")
+        self.browse_btn.clicked.connect(self.browse_logo)
+        logo_layout.addWidget(self.browse_btn)
+        form_layout.addRow("Logo Path:", logo_layout)
+
+        self.origin_input = QLineEdit()
+        self.origin_input.setPlaceholderText("e.g. India (Optional)")
+        form_layout.addRow("Origin:", self.origin_input)
+
+        right_layout.addWidget(editor_group)
+
+        # Action Buttons
+        btn_layout = QGridLayout()
+        
+        self.new_btn = QPushButton("Add New Brand")
+        self.new_btn.setStyleSheet("background-color: #17a2b8; color: white; font-weight: bold;")
+        self.new_btn.clicked.connect(self.prepare_for_new)
+        btn_layout.addWidget(self.new_btn, 0, 0)
+
+        self.save_btn = QPushButton("Save Brand")
+        self.save_btn.setStyleSheet("background-color: #28a745; color: white; font-weight: bold;")
+        self.save_btn.clicked.connect(self.save_brand)
+        btn_layout.addWidget(self.save_btn, 0, 1)
+
+        self.delete_btn = QPushButton("Delete Selected")
+        self.delete_btn.setStyleSheet("background-color: #dc3545; color: white;")
+        self.delete_btn.clicked.connect(self.delete_brand)
+        btn_layout.addWidget(self.delete_btn, 1, 0, 1, 2)
+
+        right_layout.addLayout(btn_layout)
+        right_layout.addStretch()
+
+        layout.addWidget(right_widget, 1)
+
+    def load_brands(self):
+        try:
+            conn = sqlite3.connect(str(self.db_path))
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, name, logo_path, origin FROM brands ORDER BY id ASC")
+            rows = cursor.fetchall()
+            conn.close()
+
+            self.table.setRowCount(len(rows))
+            for r_idx, row in enumerate(rows):
+                for c_idx, val in enumerate(row):
+                    item = QTableWidgetItem(str(val) if val is not None else "")
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                    self.table.setItem(r_idx, c_idx, item)
+            self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        except Exception as e:
+            QMessageBox.critical(self, "Database Error", f"Failed to load brands:\n{e}")
+
+    def on_row_selected(self):
+        selected_items = self.table.selectedItems()
+        if not selected_items:
+            return
+        row = selected_items[0].row()
+        b_id = self.table.item(row, 0).text()
+        name = self.table.item(row, 1).text()
+        logo = self.table.item(row, 2).text()
+        origin = self.table.item(row, 3).text()
+
+        self.id_label.setText(b_id)
+        self.name_input.setText(name)
+        self.logo_path_input.setText(logo)
+        self.origin_input.setText(origin)
+
+    def prepare_for_new(self):
+        self.table.clearSelection()
+        self.id_label.setText("Auto-Generated (New)")
+        self.name_input.clear()
+        self.logo_path_input.clear()
+        self.origin_input.clear()
+        self.name_input.setFocus()
+
+    def browse_logo(self):
+        file_name, _ = QFileDialog.getOpenFileName(self, "Select Brand Logo", "", "Images (*.png *.jpg *.jpeg *.gif *.svg *.bmp)")
+        if file_name:
+            import shutil
+            logos_dir = Path("data/brand_logos")
+            logos_dir.mkdir(parents=True, exist_ok=True)
+            dest_path = logos_dir / Path(file_name).name
+            try:
+                shutil.copy2(file_name, dest_path)
+                self.logo_path_input.setText(str(dest_path.relative_to(Path("."))))
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to copy logo:\n{e}")
+
+    def save_brand(self):
+        name = self.name_input.text().strip().upper()
+        if not name:
+            QMessageBox.warning(self, "Input Error", "Brand name is required.")
+            return
+
+        logo = self.logo_path_input.text().strip()
+        origin = self.origin_input.text().strip()
+        is_new = (self.id_label.text() == "Auto-Generated (New)")
+
+        try:
+            conn = sqlite3.connect(str(self.db_path))
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS brands (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT UNIQUE NOT NULL,
+                    logo_path TEXT,
+                    origin TEXT
+                )
+            """)
+
+            if is_new:
+                cursor.execute("SELECT MAX(id) FROM brands")
+                max_val = cursor.fetchone()[0]
+                next_id = (max_val or 0) + 1
+                cursor.execute(
+                    "INSERT INTO brands (id, name, logo_path, origin) VALUES (?, ?, ?, ?)",
+                    (next_id, name, logo or None, origin or None)
+                )
+            else:
+                b_id = int(self.id_label.text())
+                cursor.execute(
+                    "UPDATE brands SET name=?, logo_path=?, origin=? WHERE id=?",
+                    (name, logo or None, origin or None, b_id)
+                )
+            conn.commit()
+            conn.close()
+            QMessageBox.information(self, "Success", "Brand saved successfully.")
+            self.load_brands()
+            self.prepare_for_new()
+        except sqlite3.IntegrityError:
+            QMessageBox.critical(self, "Error", f"Brand name '{name}' already exists in database.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save brand:\n{e}")
+
+    def delete_brand(self):
+        selected_items = self.table.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "Selection Error", "Please select a brand to delete.")
+            return
+        row = selected_items[0].row()
+        b_id = int(self.table.item(row, 0).text())
+        b_name = self.table.item(row, 1).text()
+
+        reply = QMessageBox.question(
+            self,
+            "Confirm Delete",
+            f"Are you sure you want to delete brand '{b_name}' (ID: {b_id})?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            try:
+                conn = sqlite3.connect(str(self.db_path))
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM brands WHERE id=?", (b_id,))
+                conn.commit()
+                conn.close()
+                QMessageBox.information(self, "Deleted", "Brand deleted successfully.")
+                self.load_brands()
+                self.prepare_for_new()
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to delete brand:\n{e}")
+
+
 class SRProductsArchiveDialog(QDialog):
     """Dialog for loading and viewing Excel sheets from Dropbox"""
     def __init__(self, parent=None):
@@ -1612,6 +1891,18 @@ class SRProductsArchiveDialog(QDialog):
                     if item_desc and item_desc != 'nan':
                         all_by_vendor_item[(vendor_val, item_desc)] = row
                     
+            # Load brands list from SQLite database
+            brands_list = []
+            try:
+                init_brand_db()
+                conn = sqlite3.connect("sr_retail_brands.db")
+                cursor = conn.cursor()
+                cursor.execute("SELECT id, name, logo_path, origin FROM brands ORDER BY LENGTH(name) DESC, name ASC")
+                brands_list = cursor.fetchall()
+                conn.close()
+            except Exception as e:
+                print(f"Error loading brands from DB: {e}")
+
             # Cache for Barcode: {artno: {item: Barcode}}
             barcode_cache = {}
             
@@ -1641,9 +1932,34 @@ class SRProductsArchiveDialog(QDialog):
                         matched_row = all_by_item[desc_val]
                     
                 if matched_row is not None:
-                    # Modify name column value
+                    # 1. Process description to update Name column value
                     name_val = matched_row.get('Name')
-                    df_merge_processed.at[idx, 'Name'] = name_val
+                    item_desc = matched_row.get('item', '')
+                    if pd.isna(item_desc) or not str(item_desc).strip():
+                        item_desc = get_row_desc(row_merge)
+                    
+                    # Check if there is a package multiplier pattern
+                    has_multiplier = False
+                    if item_desc:
+                        has_multiplier = bool(re.search(r'\b\d+\s*[xX*]\s*(\d+(?:\.\d+)?)\s*(kg|g|l|ml|pcs|piece|pieces|oz|lbs)\b', str(item_desc), flags=re.IGNORECASE))
+                    
+                    # Normalize description if multiplier present
+                    normalized_name = ""
+                    if has_multiplier and item_desc:
+                        normalized_name = normalize_description_to_name(str(item_desc))
+                    
+                    # 2. Extract brand using database
+                    detected_brand = ""
+                    if item_desc:
+                        detected_brand = extract_brand_from_desc(str(item_desc), brands_list)
+                    
+                    if normalized_name:
+                        # Capitalize brand prefix if detected
+                        if detected_brand and normalized_name.upper().startswith(detected_brand.upper()):
+                            normalized_name = detected_brand + normalized_name[len(detected_brand):]
+                        df_merge_processed.at[idx, 'Name'] = normalized_name
+                    else:
+                        df_merge_processed.at[idx, 'Name'] = name_val
                     
                     # Copy standard columns
                     for col in ['Category', 'Sub-Category', '7 days']:
@@ -1663,10 +1979,13 @@ class SRProductsArchiveDialog(QDialog):
                         for col in ['Tag', 'Kassen', 'Rack']:
                             df_merge_processed.at[idx, col] = matched_row.get(col)
                             
-                        # Copy Brand, sku, inv, total cost
-                        brand_val = matched_row.get('Brand') if 'Brand' in matched_row else matched_row.get('brand')
-                        df_merge_processed.at[idx, 'Brand'] = brand_val
-                        
+                        # Set Brand using database value or fallback
+                        if detected_brand:
+                            df_merge_processed.at[idx, 'Brand'] = detected_brand
+                        else:
+                            brand_val = matched_row.get('Brand') if 'Brand' in matched_row else matched_row.get('brand')
+                            df_merge_processed.at[idx, 'Brand'] = brand_val
+                            
                         sku_val = matched_row.get('sku') if 'sku' in matched_row else matched_row.get('SKU')
                         df_merge_processed.at[idx, 'sku'] = sku_val
                         
@@ -3873,6 +4192,7 @@ class VendorManagerApp(QMainWindow):
         super().__init__()
         self.setWindowTitle("Sunrise Supermarket Vendor Manager")
         self.setMinimumSize(1200, 760)
+        init_brand_db()
         self.db = DatabaseManager(DB_FILE)
         self.loader = ExcelLoader(VENDOR_ROOT)
         self.current_vendor: Optional[str] = None
@@ -3923,6 +4243,8 @@ class VendorManagerApp(QMainWindow):
         self.refresh_view_button.clicked.connect(self.refresh_product_list)
         self.archive_button = QPushButton("SR Products Archive")
         self.archive_button.clicked.connect(self.open_archive_dialog)
+        self.shopfloor_brands_button = QPushButton("Shopfloor Retail Brands")
+        self.shopfloor_brands_button.clicked.connect(self.open_shopfloor_brands_dialog)
         left_panel.addWidget(self.sync_vendor_button)
         left_panel.addWidget(self.sync_all_button)
         left_panel.addWidget(self.invoices_button)
@@ -3932,6 +4254,7 @@ class VendorManagerApp(QMainWindow):
         left_panel.addWidget(self.vendor_details_button)
         left_panel.addWidget(self.refresh_view_button)
         left_panel.addWidget(self.archive_button)
+        left_panel.addWidget(self.shopfloor_brands_button)
         
         left_panel.addStretch()
         self.server_info_label = QLabel("Initializing server...")
@@ -4163,6 +4486,10 @@ class VendorManagerApp(QMainWindow):
 
     def open_archive_dialog(self) -> None:
         dialog = SRProductsArchiveDialog(parent=self)
+        dialog.exec_()
+
+    def open_shopfloor_brands_dialog(self) -> None:
+        dialog = ShopfloorBrandsDialog(parent=self)
         dialog.exec_()
 
     def open_invoices_dialog(self) -> None:

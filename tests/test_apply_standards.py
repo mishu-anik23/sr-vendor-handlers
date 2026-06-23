@@ -371,5 +371,37 @@ class TestApplyStandards(unittest.TestCase):
             except Exception:
                 pass
 
+    def test_brand_extraction_and_name_normalization(self):
+        from main import init_brand_db, normalize_description_to_name, extract_brand_from_desc
+        import sqlite3
+        
+        # Test 1: init_brand_db creates db and populates it
+        db_path = Path("sr_retail_brands.db")
+        init_brand_db()
+        self.assertTrue(db_path.exists())
+        
+        conn = sqlite3.connect("sr_retail_brands.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM brands")
+        count = cursor.fetchone()[0]
+        conn.close()
+        self.assertGreater(count, 0)
+        
+        # Test 2: normalize_description_to_name
+        self.assertEqual(normalize_description_to_name("TRS Chana Dal 10 x 1kg"), "TRS Chana Dal 1 KG")
+        self.assertEqual(normalize_description_to_name("LKK Soy Sauce 6 x 500ml"), "LKK Soy Sauce 500 ML")
+        self.assertEqual(normalize_description_to_name("No Multiplier Item"), "No Multiplier Item")
+        
+        # Test 3: extract_brand_from_desc
+        brands_list = [
+            (1, 'TRS', None, None),
+            (2, 'AASHIRVAAD', None, None),
+            (3, 'LKK', None, None)
+        ]
+        self.assertEqual(extract_brand_from_desc("TRS Chana Dal 10 x 1kg", brands_list), "TRS")
+        self.assertEqual(extract_brand_from_desc("AASHIRVAAD Atta 10kg", brands_list), "AASHIRVAAD")
+        self.assertEqual(extract_brand_from_desc("LKK SOY SAUCE 150ML", brands_list), "LKK")
+        self.assertEqual(extract_brand_from_desc("Some Generic Product", brands_list), "")
+
 if __name__ == "__main__":
     unittest.main()

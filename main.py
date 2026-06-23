@@ -1165,7 +1165,18 @@ class SRProductsArchiveDialog(QDialog):
             self.vendor_filter.clear()
 
         if date_col != -1:
-            self.date_filter.add_items(sorted(list(dates)))
+            def parse_date_key(d_str):
+                if not d_str or str(d_str).strip() in ("", "nan", "None", "N/A"):
+                    return pd.Timestamp.min
+                try:
+                    dt = pd.to_datetime(d_str, dayfirst=True, errors='coerce')
+                    if pd.isnull(dt):
+                        return pd.Timestamp.min
+                    return dt
+                except Exception:
+                    return pd.Timestamp.min
+            sorted_dates = sorted(list(dates), key=parse_date_key, reverse=True)
+            self.date_filter.add_items(sorted_dates)
         else:
             self.date_filter.clear()
 
@@ -1953,13 +1964,23 @@ class SRProductsArchiveDialog(QDialog):
                     if item_desc:
                         detected_brand = extract_brand_from_desc(str(item_desc), brands_list)
                     
-                    if normalized_name:
-                        # Capitalize brand prefix if detected
-                        if detected_brand and normalized_name.upper().startswith(detected_brand.upper()):
-                            normalized_name = detected_brand + normalized_name[len(detected_brand):]
-                        df_merge_processed.at[idx, 'Name'] = normalized_name
+                    target_name = normalized_name if normalized_name else name_val
+                    if pd.isna(target_name):
+                        target_name = ""
                     else:
-                        df_merge_processed.at[idx, 'Name'] = name_val
+                        target_name = str(target_name).strip()
+
+                    if detected_brand and target_name:
+                        start_boundary = r'\b' if detected_brand[0].isalnum() else ''
+                        end_boundary = r'\b' if detected_brand[-1].isalnum() else ''
+                        pattern = start_boundary + re.escape(detected_brand) + end_boundary
+                        cleaned_name = re.sub(pattern, '', target_name, flags=re.IGNORECASE)
+                        cleaned_name = re.sub(r'\s+', ' ', cleaned_name).strip()
+                        target_name = f"{detected_brand} {cleaned_name}"
+                    elif detected_brand and not target_name:
+                        target_name = detected_brand
+
+                    df_merge_processed.at[idx, 'Name'] = target_name
                     
                     # Copy standard columns
                     for col in ['Category', 'Sub-Category', '7 days']:

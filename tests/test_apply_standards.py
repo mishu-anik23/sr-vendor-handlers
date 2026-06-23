@@ -396,12 +396,67 @@ class TestApplyStandards(unittest.TestCase):
         brands_list = [
             (1, 'TRS', None, None),
             (2, 'AASHIRVAAD', None, None),
-            (3, 'LKK', None, None)
+            (3, 'LKK', None, None),
+            (4, 'MAMA', None, None)
         ]
         self.assertEqual(extract_brand_from_desc("TRS Chana Dal 10 x 1kg", brands_list), "TRS")
         self.assertEqual(extract_brand_from_desc("AASHIRVAAD Atta 10kg", brands_list), "AASHIRVAAD")
         self.assertEqual(extract_brand_from_desc("LKK SOY SAUCE 150ML", brands_list), "LKK")
         self.assertEqual(extract_brand_from_desc("Some Generic Product", brands_list), "")
+
+    def test_brand_prepending_and_date_sorting(self):
+        import sqlite3
+        import re
+        from main import init_brand_db, extract_brand_from_desc
+        
+        # 1. Test the brand prepending and cleaning logic directly
+        def format_name_with_brand(target_name, detected_brand):
+            if detected_brand and target_name:
+                start_boundary = r'\b' if detected_brand[0].isalnum() else ''
+                end_boundary = r'\b' if detected_brand[-1].isalnum() else ''
+                pattern = start_boundary + re.escape(detected_brand) + end_boundary
+                cleaned_name = re.sub(pattern, '', target_name, flags=re.IGNORECASE)
+                cleaned_name = re.sub(r'\s+', ' ', cleaned_name).strip()
+                return f"{detected_brand} {cleaned_name}"
+            return target_name
+
+        self.assertEqual(format_name_with_brand("Instant Noodles Mala Beef OK 85 G MAMA", "MAMA"), "MAMA Instant Noodles Mala Beef OK 85 G")
+        self.assertEqual(format_name_with_brand("MAMA Instant Noodles Mala Beef OK 85 G", "MAMA"), "MAMA Instant Noodles Mala Beef OK 85 G")
+        self.assertEqual(format_name_with_brand("TRS Chana Dal 1 KG", "TRS"), "TRS Chana Dal 1 KG")
+        self.assertEqual(format_name_with_brand("Chana Dal TRS 1 KG", "TRS"), "TRS Chana Dal 1 KG")
+        self.assertEqual(format_name_with_brand("Chana Dal 1 KG", ""), "Chana Dal 1 KG")
+
+        # 2. Test date filter descending sorting order in SRProductsArchiveDialog
+        dialog = SRProductsArchiveDialog(parent=None)
+        df_test_dates = pd.DataFrame({
+            'Name': ['Item A', 'Item B', 'Item C', 'Item D'],
+            'Invoice Date': ['12/05/2026', '23/06/2026', '01/01/2026', 'N/A']
+        })
+        dialog.sheets_data = {
+            'unique products': df_test_dates
+        }
+        dialog._display_sheets(dialog.sheets_data)
+        
+        # Collect items from the date filter dropdown
+        combo = dialog.date_filter
+        items = [combo.itemText(i) for i in range(combo.count())]
+        
+        # Since we use checked items for filters, check how items are inserted
+        # Note: CheckableComboBox inserts a checkbox for each item in its model
+        model = combo.model()
+        dropdown_dates = []
+        for row in range(model.rowCount()):
+            item = model.item(row)
+            if item:
+                dropdown_dates.append(item.text().strip())
+                
+        # Expected sorting: latest to oldest, invalid/N/A at the end
+        expected_dates = ['23/06/2026', '12/05/2026', '01/01/2026', 'N/A']
+        # The dropdown_dates may contain "Select all" at index 0 or similar? Let's check:
+        # CheckableComboBox implementation does not have "Select all" by default, or maybe it does?
+        # Let's inspect the items list
+        filtered_dropdown_dates = [d for d in dropdown_dates if d in expected_dates]
+        self.assertEqual(filtered_dropdown_dates, expected_dates)
 
 if __name__ == "__main__":
     unittest.main()

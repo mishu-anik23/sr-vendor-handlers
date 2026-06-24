@@ -171,15 +171,15 @@ class TestApplyStandards(unittest.TestCase):
         self.assertEqual(len(df_processed), 3)
         
         # Apple Juice (INV-1) -> 'asian'
-        self.assertEqual(df_processed.at[0, 'Name'], 'Golden Apple Juice Unique')
+        self.assertEqual(df_processed.at[0, 'Name'], 'GOLDEN APPLE JUICE UNIQUE')
         self.assertEqual(df_processed.at[0, 'Vendor'], 'asian')
         
         # Banana Shake (INV-2) -> 'asian1'
-        self.assertEqual(df_processed.at[1, 'Name'], 'Yellow Banana Shake Unique')
+        self.assertEqual(df_processed.at[1, 'Name'], 'YELLOW BANANA SHAKE UNIQUE')
         self.assertEqual(df_processed.at[1, 'Vendor'], 'asian1')
         
         # Cherry Pie (INV-3) -> 'asian2' (since it was the first occurrence)
-        self.assertEqual(df_processed.at[2, 'Name'], 'Red Cherry Pie Unique')
+        self.assertEqual(df_processed.at[2, 'Name'], 'RED CHERRY PIE UNIQUE')
         self.assertEqual(df_processed.at[2, 'Vendor'], 'asian2')
         
         # Verify brand, sku, inv, total cost copied correctly
@@ -457,6 +457,97 @@ class TestApplyStandards(unittest.TestCase):
         # Let's inspect the items list
         filtered_dropdown_dates = [d for d in dropdown_dates if d in expected_dates]
         self.assertEqual(filtered_dropdown_dates, expected_dates)
+
+    def test_gft_packaging_cleaning(self):
+        from main import clean_packaging_info
+        
+        self.assertEqual(clean_packaging_info("HALDIRAM NIMBU MASALA 10x200g"), "HALDIRAM NIMBU MASALA")
+        self.assertEqual(clean_packaging_info("HALDIRAM NIMBU MASALA 10 x 200g"), "HALDIRAM NIMBU MASALA")
+        self.assertEqual(clean_packaging_info("HALDIRAM NIMBU MASALA 10*200g"), "HALDIRAM NIMBU MASALA")
+        self.assertEqual(clean_packaging_info("HALDIRAM NIMBU MASALA 200g"), "HALDIRAM NIMBU MASALA")
+        self.assertEqual(clean_packaging_info("HALDIRAM NIMBU MASALA 1.5l"), "HALDIRAM NIMBU MASALA")
+        self.assertEqual(clean_packaging_info("No Packaging Item"), "No Packaging Item")
+
+    def test_gft_apply_standards_matching_and_barcode_propagation(self):
+        # Test full end-to-end matching for GFT and barcode caching/propagation
+        dialog = SRProductsArchiveDialog(parent=None)
+        dialog.selected_vendor_name = "gft"
+        dialog.selected_file_type = "merge"
+        
+        # Standard loaded database (df_source) contains descriptions without packaging info
+        df_source = pd.DataFrame({
+            'Art No': ['G100', 'G200', 'G300'],
+            'item': ['HALDIRAM NIMBU MASALA', 'GFT Juice Drink', 'GFT Snack Box'],
+            'Name': ['Haldiram Nimbu Masala Standard', 'GFT Juice Standard', 'GFT Snack Standard'],
+            'Category': ['Snacks', 'Drinks', 'Snacks'],
+            'Sub-Category': ['Namkeen', 'Juice', 'Box'],
+            'Steur': [7, 19, 7],
+            'unit_price': [1.0, 2.0, 3.0],
+            'sale_price': [2.0, 4.0, 6.0],
+            'margin_50': [50, 50, 50],
+            'Barcode': ['7777777777777', '', ''], # Only G100 has barcode in standard database
+            'Vendor': ['gft', 'gft', 'gft']
+        })
+        dialog.sheets_data = {
+            'All': df_source,
+            'product': df_source
+        }
+        
+        # Merge sheet contains descriptions with packaging info and reordered rows with missing barcodes
+        df_merge = pd.DataFrame({
+            'Invoice Date': ['2026-06-01', '2026-06-02', '2026-06-03', '2026-06-04'],
+            'Invoice Number': ['I-1', 'I-2', 'I-3', 'I-4'],
+            'Item No.': ['G100', 'G200', 'G200', 'G300'],
+            # G200 appears twice (reordered/reentered)
+            # Row 1 (I-2) has a barcode in merge sheet, Row 2 (I-3) has missing barcode
+            'Description': ['HALDIRAM NIMBU MASALA 10x200g', 'GFT Juice Drink 6x1l', 'GFT Juice Drink 6x1l', 'GFT Snack Box 12x50g'],
+            'Vat%': [7.0, 19.0, 19.0, 7.0],
+            'Barcode': ['', '8888888888888', '', ''], # Row 1 has barcode, Row 2 is missing it
+            'Name': ['Old name 1', 'Old name 2', 'Old name 3', 'Old name 4']
+        })
+        
+        dialog.raw_excel_content = b"fake bytes"
+        dialog.selected_file_path = str(self.merge_excel_path)
+        
+        # Run standardisation process
+        # We override standard display sheet to avoid UI rendering overhead
+        original_display = dialog._display_sheets
+        dialog._display_sheets = lambda sheets: None
+        
+        dialog.processed_sheets = {}
+        # Manually run the standardisation logic using df_merge
+        # We simulate the display sheet prep by copying df_merge
+        df_merge_processed = df_merge.copy()
+        
+        # Temporarily mock the dialog's sheets_data['All'] or product_sheet
+        dialog.sheets_data['All'] = df_source
+        
+        # Let's call the standardisation logic
+        # To do this cleanly, we can trigger apply_sunrise_standard but we mock read_excel
+        import unittest.mock as mock
+        with mock.patch('main.QMessageBox.critical') as mock_critical, \
+             mock.patch('pandas.read_excel') as mock_read:
+            # First read: loads df_merge, second read: statistics or similar
+            mock_read.side_effect = [df_merge, df_source]
+            dialog.apply_sunrise_standard()
+            mock_critical.assert_not_called()
+            
+        df_res = dialog.processed_sheets['SR standard Archives']
+        
+        # Check descriptions matched correctly (packaging removed before comparison) and converted to All Capital Case
+        self.assertEqual(df_res.at[0, 'Name'], 'HALDIRAM NIMBU MASALA STANDARD')
+        self.assertEqual(df_res.at[1, 'Name'], 'GFT JUICE STANDARD')
+        self.assertEqual(df_res.at[3, 'Name'], 'GFT SNACK STANDARD')
+        
+        # Check barcode propagation
+        # G100: copied barcode '7777777777777' from standard database
+        self.assertEqual(str(df_res.at[0, 'Barcode']), '7777777777777')
+        
+        # G200 (Row 1): preserved existing barcode '8888888888888'
+        self.assertEqual(str(df_res.at[1, 'Barcode']), '8888888888888')
+        
+        # G200 (Row 2): reordered row, filled with cached barcode '8888888888888' from Row 1
+        self.assertEqual(str(df_res.at[2, 'Barcode']), '8888888888888')
 
 if __name__ == "__main__":
     unittest.main()

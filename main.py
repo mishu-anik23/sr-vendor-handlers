@@ -560,6 +560,24 @@ def extract_brand_from_desc(desc_str: str, brands_list: list) -> str:
     return ""
 
 
+def clean_packaging_info(desc_str: str) -> str:
+    if not desc_str:
+        return ""
+    desc_str = str(desc_str).strip()
+    
+    # 1. Multiplier pattern: e.g. 10x200g, 10 x 200g, 10*200g, etc.
+    pattern1 = r'\b\d+\s*[xX*]\s*\d+(?:\.\d+)?\s*(?:kg|g|l|ml|pcs|piece|pieces|oz|lbs)?\b'
+    cleaned = re.sub(pattern1, '', desc_str, flags=re.IGNORECASE)
+    
+    # 2. Standalone weight/volume: e.g. 200g, 1kg, 500ml, etc.
+    pattern2 = r'\b\d+(?:\.\d+)?\s*(?:kg|g|l|ml|pcs|piece|pieces|oz|lbs)\b'
+    cleaned = re.sub(pattern2, '', cleaned, flags=re.IGNORECASE)
+    
+    # Clean extra spaces
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
+
+
 class ShopfloorBrandsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1751,7 +1769,6 @@ class SRProductsArchiveDialog(QDialog):
                 if not sheet_name:
                     sheet_name = xls.sheet_names[0]
                 df_original_merge = pd.read_excel(xls, sheet_name=sheet_name)
-            
             df_merge_processed = df_original_merge.copy()
 
             # 1. Rearrange from oldest order (sort chronologically)
@@ -1842,6 +1859,37 @@ class SRProductsArchiveDialog(QDialog):
                         rows_to_keep.append(idx)
                 df_merge_processed = df_merge_processed.iloc[rows_to_keep].reset_index(drop=True)
 
+            # Initialize cache for Barcode: {artno: {item: Barcode}}
+            barcode_cache = {}
+            barcode_by_art_no = {}
+            
+            def cache_barcode_val(art_no, desc, bc):
+                if pd.isna(bc) or str(bc).strip() == '' or str(bc).strip().lower() in ('nan', 'none'):
+                    return
+                bc_str = str(bc).strip()
+                if bc_str.endswith('.0'):
+                    bc_str = bc_str[:-2]
+                
+                art_clean = str(art_no).strip().lower()
+                if art_clean.endswith('.0'):
+                    art_clean = art_clean[:-2]
+                    
+                desc_clean = str(desc).strip().lower()
+                if art_clean:
+                    if art_clean not in barcode_cache:
+                        barcode_cache[art_clean] = {}
+                    barcode_cache[art_clean][desc_clean] = bc_str
+                    barcode_by_art_no[art_clean] = bc_str
+
+            # Seed cache with existing barcodes in the merge sheet before columns are dropped
+            if 'Barcode' in df_merge_processed.columns:
+                for idx in range(len(df_merge_processed)):
+                    row_merge = df_merge_processed.iloc[idx]
+                    bc = row_merge.get('Barcode')
+                    art_no = get_row_item_no(row_merge)
+                    desc = get_row_desc(row_merge)
+                    cache_barcode_val(art_no, desc, bc)
+
             if self.selected_file_type == 'unique':
                 cols_to_add = ['Brand', 'Category', 'Sub-Category', 'Steur', 'unit_price', 'sale_price', 'margin_50', '7 days', 'Barcode', 'sku', 'inv', 'total cost']
             else:
@@ -1927,12 +1975,25 @@ class SRProductsArchiveDialog(QDialog):
                 if item_desc and item_desc != 'nan':
                     all_by_item[item_desc] = row
                     
+                    # If vendor is gft, also add key without packaging
+                    is_row_gft = (vendor_val == 'gft') or (self.selected_vendor_name and self.selected_vendor_name.lower() == 'gft')
+                    if is_row_gft:
+                        cleaned_item_desc = clean_packaging_info(item_desc).lower()
+                        if cleaned_item_desc:
+                            all_by_item[cleaned_item_desc] = row
+                    
                 # Vendor specific maps
                 if vendor_val and vendor_val != 'nan':
                     if art_no and art_no != 'nan':
                         all_by_vendor_art[(vendor_val, art_no)] = row
                     if item_desc and item_desc != 'nan':
                         all_by_vendor_item[(vendor_val, item_desc)] = row
+                        
+                        is_row_gft = (vendor_val == 'gft') or (self.selected_vendor_name and self.selected_vendor_name.lower() == 'gft')
+                        if is_row_gft:
+                            cleaned_item_desc = clean_packaging_info(item_desc).lower()
+                            if cleaned_item_desc:
+                                all_by_vendor_item[(vendor_val, cleaned_item_desc)] = row
                     
             # Load brands list from SQLite database
             brands_list = []
@@ -1946,9 +2007,8 @@ class SRProductsArchiveDialog(QDialog):
             except Exception as e:
                 print(f"Error loading brands from DB: {e}")
 
-            # Cache for Barcode: {artno: {item: Barcode}}
-            barcode_cache = {}
-            
+            # Cache is already populated before columns were dropped
+
             # First pass: compare and find matches, populate cache, write values
             for idx in range(len(df_merge_processed)):
                 row_merge = df_merge_processed.iloc[idx]
@@ -1957,6 +2017,11 @@ class SRProductsArchiveDialog(QDialog):
                 item_no_val = get_row_item_no(row_merge).lower()
                 desc_val = get_row_desc(row_merge).lower()
                 vendor_val = str(row_merge.get('Vendor', '')).strip().lower()
+                
+                # If vendor is gft, clean packaging info before lookup
+                is_row_gft = (vendor_val == 'gft') or (self.selected_vendor_name and self.selected_vendor_name.lower() == 'gft')
+                if is_row_gft:
+                    desc_val = clean_packaging_info(desc_val).lower()
                 
                 matched_row = None
                 
@@ -2012,7 +2077,7 @@ class SRProductsArchiveDialog(QDialog):
                     elif detected_brand and not target_name:
                         target_name = detected_brand
 
-                    df_merge_processed.at[idx, 'Name'] = target_name
+                    df_merge_processed.at[idx, 'Name'] = target_name.upper()
                     
                     # Copy standard columns
                     for col in ['Category', 'Sub-Category', '7 days']:
@@ -2063,22 +2128,41 @@ class SRProductsArchiveDialog(QDialog):
                         art_no_clean = art_no_clean[:-2]
                     item_clean = str(matched_row.get('item', '')).strip()
                     
-                    has_barcode = pd.notna(barcode_val) and str(barcode_val).strip() != '' and str(barcode_val).strip().lower() != 'nan'
+                    has_db_barcode = pd.notna(barcode_val) and str(barcode_val).strip() != '' and str(barcode_val).strip().lower() != 'nan'
                     
-                    if has_barcode:
+                    # Retrieve the original barcode from our pre-drop cache
+                    existing_bc = None
+                    art_clean = str(art_no_clean).strip().lower()
+                    desc_clean = str(item_clean).strip().lower()
+                    if art_clean in barcode_cache:
+                        if desc_clean in barcode_cache[art_clean]:
+                            existing_bc = barcode_cache[art_clean][desc_clean]
+                        elif is_row_gft:
+                            cleaned_desc = clean_packaging_info(desc_clean).lower()
+                            if cleaned_desc in barcode_cache[art_clean]:
+                                existing_bc = barcode_cache[art_clean][cleaned_desc]
+                                
+                    if not existing_bc and art_clean in barcode_by_art_no:
+                        existing_bc = barcode_by_art_no[art_clean]
+                        
+                    has_existing_barcode = existing_bc is not None
+                    
+                    if has_db_barcode:
                         barcode_str = str(barcode_val).strip()
                         if barcode_str.endswith('.0'):
                             barcode_str = barcode_str[:-2]
-                        # Add to cache
-                        if art_no_clean not in barcode_cache:
-                            barcode_cache[art_no_clean] = {}
-                        barcode_cache[art_no_clean][item_clean] = barcode_str
-                        
+                        cache_barcode_val(art_no_clean, item_clean, barcode_str)
+                        df_merge_processed.at[idx, 'Barcode'] = barcode_str
+                    elif has_existing_barcode:
+                        barcode_str = str(existing_bc).strip()
+                        if barcode_str.endswith('.0'):
+                            barcode_str = barcode_str[:-2]
+                        cache_barcode_val(art_no_clean, item_clean, barcode_str)
                         df_merge_processed.at[idx, 'Barcode'] = barcode_str
                     else:
                         df_merge_processed.at[idx, 'Barcode'] = None
                         
-            # Second pass: fill in barcode from cache for repeat rows
+            # Second pass: fill in barcode from cache for repeat/reordered/reentered rows
             for idx in range(len(df_merge_processed)):
                 row_merge = df_merge_processed.iloc[idx]
                 barcode_val = row_merge.get('Barcode')
@@ -2087,9 +2171,25 @@ class SRProductsArchiveDialog(QDialog):
                     item_no_val = get_row_item_no(row_merge)
                     desc_val = get_row_desc(row_merge)
                     
+                    art_clean = str(item_no_val).strip().lower()
+                    if art_clean.endswith('.0'):
+                        art_clean = art_clean[:-2]
+                    desc_clean = str(desc_val).strip().lower()
+                    
+                    # Also try the cleaned description if GFT
+                    is_row_gft = (str(row_merge.get('Vendor', '')).strip().lower() == 'gft') or (self.selected_vendor_name and self.selected_vendor_name.lower() == 'gft')
+                    
                     cached_barcode = None
-                    if item_no_val in barcode_cache and desc_val in barcode_cache[item_no_val]:
-                        cached_barcode = barcode_cache[item_no_val][desc_val]
+                    if art_clean in barcode_cache:
+                        if desc_clean in barcode_cache[art_clean]:
+                            cached_barcode = barcode_cache[art_clean][desc_clean]
+                        elif is_row_gft:
+                            cleaned_desc = clean_packaging_info(desc_clean).lower()
+                            if cleaned_desc in barcode_cache[art_clean]:
+                                cached_barcode = barcode_cache[art_clean][cleaned_desc]
+                                
+                    if not cached_barcode and art_clean in barcode_by_art_no:
+                        cached_barcode = barcode_by_art_no[art_clean]
                         
                     if cached_barcode:
                         df_merge_processed.at[idx, 'Barcode'] = cached_barcode
